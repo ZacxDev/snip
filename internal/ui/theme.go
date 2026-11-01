@@ -78,10 +78,12 @@ var (
 
 // CategoryIcons maps an artifact `category` to the row's leading icon.
 //
-// 🔴 EVERY CATEGORY THE NIX LIST CAN EMIT MUST HAVE AN ENTRY. theme_test.go
-// parses nix/espanso-matches.nix and asserts this map's key set EQUALS the set
-// of categories that file declares — both directions — so a new category
-// cannot silently inherit the fallback icon forever.
+// 🔴 EVERY CATEGORY THE NIX LIST CAN EMIT MUST HAVE AN ENTRY. The consumer
+// that generates its catalog from a nix list pins the two sets equal in BOTH
+// directions against its own list (devrc's packaging is the worked example);
+// in-module, the ledger is guarded by TestEveryIconIsANonEmptyGlyph. A new
+// category with no entry renders DefaultIcon — the cosmetic defect the
+// consumer's own test exists to catch.
 //
 // ⚠ THESE ARE EMOJI ON PURPOSE, AND IT IS A MEASURED CHOICE. Alacritty carries
 // no `font` setting, so it uses fontconfig's monospace default (DejaVu Sans

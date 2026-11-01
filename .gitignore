@@ -2,3 +2,4 @@
 /snip.test
 *.test
 coverage.out
+/result

@@ -92,6 +92,24 @@ Exit codes: `0` success/no-op (a picker cancel is 0), `1` a real failure
 
 Picker keys: `↑/↓` move · `⏎` paste · `ctrl+e` edit · `esc` cancel.
 
+## Nix
+
+The repo is a flake — the package, overlay and app are all canonical here:
+
+```sh
+nix build github:ZacxDev/snip#snip      # or: nix run github:ZacxDev/snip
+# as an input, with the consumer's nixpkgs:
+#   inputs.snip.url = "github:ZacxDev/snip";
+#   inputs.snip.inputs.nixpkgs.follows = "nixpkgs";
+```
+
+`package.nix` reads the version out of `cmd/snip/version.go` (never a hand-held
+literal), pins the runtime tools the binary execs (`xclip`, `xdotool`,
+`dunstify`, `bash`, `nvim`) by store path, and runs **no** Go checks at build
+time — the tests run in CI; a red test must never be able to fail a machine
+upgrade. It does not pin `i3` (the binary falls back to `xdotool` when
+`i3-msg` is absent) and does not ship a landing script.
+
 ## The ctrl+e landing
 
 Editing lands through an external script: `$SNIP_REPO/scripts/snip-edit.sh`,
