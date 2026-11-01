@@ -5,4 +5,4 @@ package main
 // declaration's SHAPE is pinned by TestVersionDeclarationShape, which mirrors
 // the release tooling's parse: exactly one `var buildVersion = "…"` line.
 // Do not reformat this line.
-var buildVersion = "0.1.0"
+var buildVersion = "0.1.1"
