@@ -7,7 +7,8 @@ import (
 
 // The fixtures below mirror the documented traps in the detector's own test
 // suite (scripts/collector/keylog/tests/test_espanso_detect.py) and the
-// comment history of nix/espanso-matches.nix. Every one of them is a measured
+// comment history of the consumer's nix snippet list. Every one of them is a
+// measured
 // incident, not a synthetic case.
 //
 // 🔴 IDENTITY IS THE LABEL (2026-10-31). The old trigger shorthand was removed
@@ -55,7 +56,8 @@ func TestTokenMatchesLabelAndTerms(t *testing.T) {
 
 // 🔴 'ask' ⊂ 'task' — THE LABEL-THEFT TRAP. `_token_matches` is a SUBSTRING
 // test, so a token matches any label WORD that contains it: a label spelling
-// "task" claims the token "ask". The :cgt lesson (nix/espanso-matches.nix,
+// "task" claims the token "ask". The :cgt lesson (the nix snippet list's
+// history,
 // 2026-08-19): the obvious term for :cgt was "task", and 'ask' ⊂ 'task' would
 // have hijacked all 58 of :acq's 'ask' fires. v1 REPLICATES the substring
 // semantics — the blind spot carries over deliberately (scope doc §9) — so
