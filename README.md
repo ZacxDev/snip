@@ -26,6 +26,10 @@ catalog.
   mode is a flag, never an inference from an empty file.
 - **`{{clip}}`** — the one variable a body may carry, resolved at expand time
   from the X clipboard (no shell vars, no date vars, no forms).
+- **`ctrl+g` shared clipboard** — an opt-in second keypress that lists a
+  cross-device clip store as a *disjoint mode* with its own list, filter and
+  keys, and pastes a clip body into the origin window. Unconfigured by
+  default; see [The shared clipboard](#the-shared-clipboard-ctrlg).
 - **Fire telemetry** — every open/cancel/select appends a JSONL row to a
   local spool, so an audit can tell used rows from dead ones.
 
@@ -81,6 +85,8 @@ snip                 the picker TUI (default; also `snip picker`)
 snip paste           the detached paste helper (spawned by the picker)
   --label L          the snippet to paste, by its label (required)
   --body-file F      paste F's contents instead of the artifact's body
+  --ephemeral        paste F's contents WITHOUT loading the catalog
+                     (the shared clipboard's path)
 snip list            the catalog as a table (--category C to filter)
 snip search QUERY    ranked matches (the same matcher the picker runs)
 snip get LABEL       the raw body ({{clip}} unresolved)
@@ -90,7 +96,67 @@ snip expand LABEL    the resolved expansion ({{clip}} from the X clipboard)
 Exit codes: `0` success/no-op (a picker cancel is 0), `1` a real failure
 (config, X11, paste path), `2` usage.
 
-Picker keys: `↑/↓` move · `⏎` paste · `ctrl+e` edit · `esc` cancel.
+Picker keys: `↑/↓` move · `⏎` paste · `ctrl+e` edit · `ctrl+g` shared
+clipboard · `esc` cancel.
+
+## The shared clipboard (`ctrl+g`)
+
+A second keypress inside the picker switches to a **cross-device clipboard**:
+a separate, chronological, unlabelled store served over your own network, so
+text captured on another device can be pasted into the window you were just
+in. It is **opt-in and unconfigured by default** — with no config file the
+mode says so and the catalog picker is unaffected.
+
+It is a **mode, not a merged list**, and deliberately so:
+
+- a clip has no label and no declared `search_terms`, and its searchable text
+  is the *body* — which the catalog matcher never reads. Two populations, two
+  match functions; the catalog's `Rank` is untouched.
+- the key table is **disjoint**: nothing falls through to the browse keys, so
+  `ctrl+e` (edit-and-land, which has no meaning for a row from another
+  device) is swallowed rather than acting on a catalog row.
+- the list is the server's order, **verbatim** — chronological newest-first,
+  with no recency re-sort. Typing filters it by substring over the body.
+- the fetch is **lazy**: it happens on the keypress, never at picker open, so
+  an open that never asks for a clip pays no network cost.
+- a failed fetch is **not** an empty list. The three states are rendered
+  distinctly — *fetching…*, *the store is empty*, and *unreachable, with the
+  reason in words* — because "you have no clips" and "the store is down" are
+  different facts.
+- pasting carries the **body**, not an id, so the detached helper never
+  re-looks-up a row that a delete from another device may have removed in the
+  meantime. `{{clip}}` is **not** expanded in a clip body (it came from
+  another machine and has no claim on this one's clipboard), and a clip paste
+  is not recorded in the catalog's browse order.
+- clip fire rows carry their own telemetry `source` (`snipclip`), so an audit
+  of *catalog* demand never counts a clipboard paste as demand for a snippet.
+
+### Configuring it
+
+Write `~/.config/snip/shared.env`, mode **0600** — an env file with two keys:
+
+```sh
+SNIP_SHARED_URL=http://your-store.example:8080
+SNIP_SHARED_TOKEN=your-bearer-token
+```
+
+**snip ships no default endpoint and no default token, on purpose.** This is
+a public repository; an address compiled in here would be the *author's*
+network, and a token distributed in a build artifact (a Nix store path is
+world-readable) would be readable by every local user on the machine. A
+launcher wrapper may override the *path* (`SNIP_SHARED_ENV`); never the value.
+
+Missing, unreadable or short credentials are a **named failure in the picker**,
+never a silent empty list — the file path and both key names are in the
+message. The URL must be `http(s)`; the token must be at least 8 characters.
+
+The service it talks to is four routes — `GET /v1/clips?limit=N&q=…`,
+`POST /v1/clips`, `DELETE /v1/clips/{id}`, `GET /healthz`. snip only
+**reads** (`GET /v1/clips?limit=N`) and filters locally; it does not capture,
+does not delete, and does not use the server's `q=` search, whose semantics
+are its own (a full-text index's substring matching is not the same rule as
+this client's per-token body substring test, and the two must not be assumed
+to agree).
 
 ## Nix
 
@@ -139,6 +205,7 @@ body never deletes by inference.
 | `SNIP_ORIGIN_WINDOW` / `SNIP_ORIGIN_CLASS` | set by the WM keybind wrapper |
 | `SNIP_QUERY` / `SNIP_OPEN_LATENCY_MS` | injected by the picker into the helper |
 | `ACTIVITY_SPOOL_DIR` | fire-row spool override |
+| `SNIP_SHARED_ENV` | shared-clipboard config **path** override (default `~/.config/snip/shared.env`, mode 0600, holding `SNIP_SHARED_URL` + `SNIP_SHARED_TOKEN`). The path only — never the token value |
 
 State paths: the recency file is `$XDG_STATE_HOME/snip/recent.json` (else
 `~/.local/state/snip/recent.json`); fire rows go to

@@ -29,6 +29,7 @@ type fakeEffects struct {
 	clipNow       string // the clipboard content as the fake sees it
 	lastKey       string
 	setCalls      int
+	sets          []string // every ClipboardSet value, in order
 	windowExistsQ int
 }
 
@@ -40,6 +41,10 @@ func (f *fakeEffects) ClipboardGet() ([]byte, bool) {
 func (f *fakeEffects) ClipboardSet(data []byte) error {
 	f.log = append(f.log, "set")
 	f.setCalls++
+	// sets records EVERY value in order: the expansion first, then the
+	// restore. clipNow only survives the last one, so a test about what was
+	// actually PASTED has to read this.
+	f.sets = append(f.sets, string(data))
 	if f.setErr != nil {
 		return f.setErr
 	}
@@ -88,14 +93,20 @@ func (f *fakeEffects) Toast(msg string) {
 	f.toasts = append(f.toasts, msg)
 }
 
-// captureRows stubs the telemetry emitter and records the rows.
-type rowCapture struct{ rows []telemetry.Payload }
+// captureRows stubs the telemetry emitter and records the rows — and, since
+// the shared clipboard landed, the SOURCE each row was emitted under: a clip
+// paste must not be counted as a catalog fire.
+type rowCapture struct {
+	rows    []telemetry.Payload
+	sources []string
+}
 
 func captureRows(t *testing.T) *rowCapture {
 	c := &rowCapture{}
 	orig := emitRowFn
-	emitRowFn = func(p telemetry.Payload) string {
+	emitRowFn = func(p telemetry.Payload, source string) string {
 		c.rows = append(c.rows, p)
+		c.sources = append(c.sources, source)
 		return ""
 	}
 	t.Cleanup(func() { emitRowFn = orig })
@@ -374,4 +385,78 @@ func contains(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// --- the shared clipboard's ephemeral paste ----------------------------------
+
+// 🔴 INVARIANT GUARDS for the Ephemeral flag's two effects. Both were watched
+// red against a copy with the flag's branch removed, with these same messages.
+
+// A clip's row carries source=snipclip, NOT source=snip. The audit's analysis
+// reads a `source='snip' AND kind='fire' AND outcome='select'` row as demand
+// for a CATALOG snippet, and a clip fire is not that.
+func TestAnEphemeralPasteIsAClipRow(t *testing.T) {
+	fx := okFake()
+	rows := captureRows(t)
+	clip := []artifact.Snippet{{Label: "4221", Body: "from another device"}}
+	r := Request{Label: "4221", OriginWindow: 946, OriginClass: "Alacritty", Ephemeral: true}
+	if res := Run(fx, clip, r); res.Outcome != "select" {
+		t.Fatalf("Run = %+v, want select", res)
+	}
+	if len(rows.sources) != 1 || rows.sources[0] != telemetry.SourceClip {
+		t.Fatalf("row sources = %v, want exactly [%s]", rows.sources, telemetry.SourceClip)
+	}
+
+	// POSITIVE CONTROL: the SAME path without the flag emits a catalog row, so
+	// the assertion above is about Ephemeral and not about a hardcoded source.
+	rows2 := captureRows(t)
+	r.Ephemeral = false
+	if res := Run(okFake(), clip, r); res.Outcome != "select" {
+		t.Fatalf("control Run = %+v, want select", res)
+	}
+	if len(rows2.sources) != 1 || rows2.sources[0] != telemetry.SourceSnip {
+		t.Fatalf("control sources = %v, want exactly [%s] — this control proves nothing",
+			rows2.sources, telemetry.SourceSnip)
+	}
+}
+
+// 🔴 NO {{clip}} EXPANSION IN A CLIP BODY. The text came from another device
+// and has no claim on THIS machine's clipboard — and the clipboard is about to
+// be overwritten with this very body, so expanding it would splice local
+// content into a remote capture.
+func TestAnEphemeralBodyIsNotClipExpanded(t *testing.T) {
+	const body = "literal {{clip}} stays literal"
+	fx := okFake() // its clipboard holds "saved-clip"
+	clip := []artifact.Snippet{{Label: "77", Body: body}}
+	r := Request{Label: "77", OriginWindow: 946, OriginClass: "Alacritty", Ephemeral: true}
+	if res := Run(fx, clip, r); res.Outcome != "select" {
+		t.Fatalf("Run = %+v, want select", res)
+	}
+	if firstSet(t, fx) != body {
+		t.Fatalf("pasted %q, want the body verbatim with {{clip}} unexpanded", firstSet(t, fx))
+	}
+	if strings.Contains(firstSet(t, fx), "saved-clip") {
+		t.Fatalf("the local clipboard was spliced into a remote capture: %q", firstSet(t, fx))
+	}
+
+	// POSITIVE CONTROL: the same body WITHOUT the flag does expand, so the
+	// check above is about Ephemeral and not about expansion being broken.
+	ctrlFx := okFake()
+	r.Ephemeral = false
+	if res := Run(ctrlFx, clip, r); res.Outcome != "select" {
+		t.Fatalf("control Run = %+v, want select", res)
+	}
+	if !strings.Contains(firstSet(t, ctrlFx), "saved-clip") {
+		t.Fatalf("the control did not expand {{clip}} (%q) — it proves nothing", firstSet(t, ctrlFx))
+	}
+}
+
+// firstSet is what the helper actually put on the clipboard to be pasted — the
+// FIRST ClipboardSet, since the restore overwrites it afterwards.
+func firstSet(t *testing.T, f *fakeEffects) string {
+	t.Helper()
+	if len(f.sets) == 0 {
+		t.Fatal("nothing was ever put on the clipboard — this assertion would be vacuous")
+	}
+	return f.sets[0]
 }

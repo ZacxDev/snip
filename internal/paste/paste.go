@@ -59,6 +59,19 @@ type Request struct {
 	OriginClass   string // SNIP_ORIGIN_CLASS
 	Query         string // SNIP_QUERY — the exact typed string (may be "")
 	OpenLatencyMS int64  // SNIP_OPEN_LATENCY_MS — the picker's open-phase number
+
+	// Ephemeral marks a SHARED-CLIPBOARD paste: the body came from another
+	// device, carried in on --body-file, and is not in the catalog at all.
+	//
+	// It changes exactly two things, and both are decisions worth writing
+	// down rather than leaving implicit:
+	//
+	//   - NO {{clip}} EXPANSION. The text came from another device and has no
+	//     claim on THIS machine's clipboard; expanding it would splice local
+	//     content into a remote capture.
+	//   - THE ROW'S SOURCE IS telemetry.SourceClip, so the audit's catalog
+	//     analysis never sees it (telemetry.SourceClip says why that matters).
+	Ephemeral bool
 }
 
 // RequestFromEnv builds the request from the process environment: the origin
@@ -97,7 +110,18 @@ type Result struct {
 
 // emitRowFn is the row emitter as a package var so tests can capture the rows
 // Run emits. Default: the shared telemetry emitter.
-var emitRowFn = func(p telemetry.Payload) string { return telemetry.EmitFire(p, "") }
+var emitRowFn = func(p telemetry.Payload, source string) string {
+	return telemetry.EmitFireSource(p, source, "")
+}
+
+// sourceFor is the row's telemetry source: a shared-clipboard paste is not a
+// catalog fire and must not be counted as one.
+func sourceFor(req Request) string {
+	if req.Ephemeral {
+		return telemetry.SourceClip
+	}
+	return telemetry.SourceSnip
+}
 
 // Run executes the paste sequence. It emits EXACTLY ONE telemetry row per
 // invocation — outcome=select on success, outcome=abort for every no-paste
@@ -126,7 +150,7 @@ func Run(eff effects.Effects, snippets []artifact.Snippet, req Request) Result {
 			Workspace:      workspace,
 			LatencyOpenMS:  req.OpenLatencyMS,
 			LatencyPasteMS: pasteMS,
-		})
+		}, sourceFor(req))
 	}
 	abort := func(why string) Result {
 		eff.Toast("snip: " + why)
@@ -155,7 +179,11 @@ func Run(eff effects.Effects, snippets []artifact.Snippet, req Request) Result {
 	// Resolve {{clip}} from the CURRENT clipboard — BEFORE the save/set pair
 	// below, so a {{clip}} snippet never resolves to its own expansion.
 	body := snippet.Body
-	if strings.Contains(body, ClipVar) {
+	// 🔴 NO {{clip}} EXPANSION IN A CLIP BODY. It came from another device and
+	// has no claim on this machine's clipboard — and the clipboard is about to
+	// be overwritten with this very body, so an expansion here would be
+	// splicing local content into a remote capture.
+	if !req.Ephemeral && strings.Contains(body, ClipVar) {
 		clip, _ := eff.ClipboardGet()
 		body = strings.ReplaceAll(body, ClipVar, string(clip))
 	}

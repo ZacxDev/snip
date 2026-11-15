@@ -9,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/ZacxDev/snip/internal/artifact"
+	"github.com/ZacxDev/snip/internal/shared"
 	"github.com/ZacxDev/snip/internal/telemetry"
 )
 
@@ -32,6 +33,30 @@ type fakeLauncher struct {
 	applyErr   error
 	deleted    []string // labels handed to ApplyDelete
 	deleteErr  error
+
+	// the shared-clipboard path
+	clips      []shared.Clip // what FetchShared returns
+	fetchErr   error         // ...or the reason it could not
+	fetches    int           // how many times FetchShared was called
+	clipIDs    []int64       // ids handed to SpawnPasteClip
+	clipBodies []string      // bodies handed to SpawnPasteClip
+	clipQuery  []string      // the SNIP_QUERY handed to each clip spawn
+}
+
+func (f *fakeLauncher) FetchShared() ([]shared.Clip, error) {
+	f.fetches++
+	if f.fetchErr != nil {
+		return nil, f.fetchErr
+	}
+	return f.clips, nil
+}
+
+func (f *fakeLauncher) SpawnPasteClip(id int64, body, query string, openLatencyMS int64) error {
+	f.clipIDs = append(f.clipIDs, id)
+	f.clipBodies = append(f.clipBodies, body)
+	f.clipQuery = append(f.clipQuery, query)
+	f.openMS = append(f.openMS, openLatencyMS)
+	return f.spawnErr
 }
 
 func (f *fakeLauncher) SpawnPaste(label, query string, openLatencyMS int64, bodyFile string) error {
@@ -848,13 +873,20 @@ func TestDeleteFailureStaysOpenWithTheReason(t *testing.T) {
 
 // --- row-emitter capture -----------------------------------------------------
 
-type capturedRows struct{ rows []telemetry.Payload }
+// capturedRows records the picker's own rows AND the source each was emitted
+// under — a cancel typed against the clip list is evidence about clips, not
+// about the catalog, and the audit's analysis keys on that source.
+type capturedRows struct {
+	rows    []telemetry.Payload
+	sources []string
+}
 
 func capturePickerRows(t *testing.T) *capturedRows {
 	c := &capturedRows{}
 	orig := emitFireFn
-	emitFireFn = func(p telemetry.Payload) string {
+	emitFireFn = func(p telemetry.Payload, source string) string {
 		c.rows = append(c.rows, p)
+		c.sources = append(c.sources, source)
 		return ""
 	}
 	t.Cleanup(func() { emitFireFn = orig })

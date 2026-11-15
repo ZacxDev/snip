@@ -26,6 +26,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/ZacxDev/snip/internal/shared"
 )
 
 // SnipWindowClass is the WM_CLASS the picker window carries — set by
@@ -420,6 +422,63 @@ func (Live) SpawnPaste(label, query string, openLatencyMS int64, bodyFile string
 	)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("spawn paste helper: %w", err)
+	}
+	go func() { _ = cmd.Wait() }() // reap the detached child; its failures toast
+	return nil
+}
+
+// --- the shared clipboard (the picker's second keypress) ----------------------
+
+// FetchShared implements picker.Launcher: read the cross-device clipboard
+// store over the mesh.
+//
+// 🔴 THE CONFIG IS THE OPERATOR'S FILE AND NOTHING ELSE. No endpoint and no
+// token is compiled in (this repo is public), so an unconfigured machine gets
+// the config loader's named failure — which the picker renders as the reason
+// the shared view is unavailable, the SNIP_REPO-unset shape.
+//
+// 🔴 EVERY FAILURE IS AN ERROR, NEVER AN EMPTY LIST: an unreadable store and
+// an empty store are different states and the picker renders them differently.
+func (Live) FetchShared() ([]shared.Clip, error) {
+	cfg, err := shared.Load()
+	if err != nil {
+		return nil, err
+	}
+	return shared.New(cfg).Rows(shared.DefaultLimit)
+}
+
+// SpawnPasteClip implements picker.Launcher: `self paste --ephemeral
+// --body-file F --label <id>` detached, with the clip's body staged in F.
+//
+// 🔴 THE BODY TRAVELS WITH THE PASTE. The helper is a separate process that
+// starts after this one quits; handing it a clip ID to re-fetch would race a
+// DELETE from another device, and the operator would get nothing (or something
+// else) after choosing what he could see. The scratch file is consumed and
+// removed by the helper, exactly as the ctrl+e edit path's file is.
+//
+// The ID is the label because the ephemeral catalog is one row and `paste`
+// identifies its row by label; it is also what the clip's telemetry row is
+// attributed to.
+func (l Live) SpawnPasteClip(id int64, body, query string, openLatencyMS int64) error {
+	bodyFile, err := l.StageEdit("clip-"+strconv.FormatInt(id, 10), body)
+	if err != nil {
+		return fmt.Errorf("stage the clip body: %w", err)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		os.Remove(bodyFile)
+		return fmt.Errorf("resolve self: %w", err)
+	}
+	cmd := exec.Command(self, "paste", "--ephemeral",
+		"--label", strconv.FormatInt(id, 10), "--body-file", bodyFile)
+	cmd.Env = append(os.Environ(),
+		"SNIP_QUERY="+query,
+		"SNIP_OPEN_LATENCY_MS="+strconv.FormatInt(openLatencyMS, 10),
+	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		os.Remove(bodyFile)
 		return fmt.Errorf("spawn paste helper: %w", err)
 	}
 	go func() { _ = cmd.Wait() }() // reap the detached child; its failures toast

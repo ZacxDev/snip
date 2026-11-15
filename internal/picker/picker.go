@@ -32,6 +32,7 @@ import (
 	"github.com/ZacxDev/snip/internal/artifact"
 	"github.com/ZacxDev/snip/internal/matcher"
 	"github.com/ZacxDev/snip/internal/paste"
+	"github.com/ZacxDev/snip/internal/shared"
 	"github.com/ZacxDev/snip/internal/telemetry"
 	"github.com/ZacxDev/snip/internal/ui"
 )
@@ -59,6 +60,29 @@ type Edit struct {
 // Update so a test can drive it with a fake.
 type ConfirmDelete struct{ Label string }
 
+// FetchShared says "read the shared clipboard store" — Update turns it into
+// the mesh fetch.
+//
+// 🔴 IT IS ONLY EVER RETURNED FROM THE SECOND KEYPRESS, NEVER FROM New(). The
+// open-latency number is measured from process entry to the first render and
+// is an acceptance criterion queried from real telemetry rows; an eager fetch
+// in New would add a mesh round trip to EVERY open, including the vast
+// majority that never ask for a clip, and would block the first render behind
+// a network call.
+type FetchShared struct{}
+
+// SelectClip says "the operator chose this clip" — Update turns it into the
+// detached ephemeral paste.
+//
+// 🔴 THE BODY IS CARRIED IN THE INTENT. The picker already holds every clip it
+// displays, and re-fetching the row after the keypress would race a DELETE
+// made from another device in between — the paste would then deliver nothing,
+// or the wrong thing, while the operator believes he pasted what he saw.
+type SelectClip struct {
+	ID   int64
+	Body string
+}
+
 // Intent is the intent sum type the pure Step returns (unexported marker
 // method, stt-voice shape).
 type Intent interface{ intentName() }
@@ -66,6 +90,8 @@ type Intent interface{ intentName() }
 func (Select) intentName()        {}
 func (Edit) intentName()          {}
 func (ConfirmDelete) intentName() {}
+func (FetchShared) intentName()   {}
+func (SelectClip) intentName()    {}
 
 // spawned reports the helper-spawn outcome back into the loop.
 type spawned struct{ Err error }
@@ -196,6 +222,44 @@ type Model struct {
 	// one that replaces a body — so it is asked about rather than acted on.
 	confirmDelete string
 
+	// mode is which population the list is showing: modeBrowse (the nix
+	// catalog) or modeShared (the cross-device clipboard). 🔴 THE MODES ARE
+	// DISJOINT, WHICH IS A SAFETY PROPERTY AND NOT ONLY A UI ONE: there is no
+	// "fall through to browse" arm anywhere in the shared key table, and the
+	// two populations are never merged into one list — a clip has no label and
+	// no declared search_terms, so Rank cannot see it, and the catalog has no
+	// body the matcher reads, so RankShared cannot see that. Two populations,
+	// two match functions, one mode field deciding which is on screen.
+	mode mode
+
+	// clips/filteredClips/clipCursor are the shared population, fetched lazily
+	// on the second keypress. fetching is in-flight; fetched is "a fetch has
+	// completed at least once", which is what makes the three renders
+	// distinguishable (fetching / reachable-but-empty / unreachable).
+	clips         []shared.Clip
+	filteredClips []shared.Clip
+	fetching      bool
+	fetched       bool
+
+	// fetchFailed is "the last fetch returned a reason, not rows".
+	//
+	// 🔴 IT CANNOT BE DERIVED FROM len(clips) == 0, AND ASSUMING IT COULD IS
+	// EXACTLY THE EMPTY-RESULT CONFLATION. A failed fetch and an empty store
+	// both leave the clip list empty, and the first draft of this render said
+	// "the shared clipboard is empty" over an i/o timeout — caught by
+	// TestThreeRendersAreDistinguishable, which is why that test exists.
+	fetchFailed bool
+
+	// NowMS is the clock the clip rows' ages are rendered against, injected so
+	// the render is pure and a test pins an exact string. 0 means "read the
+	// real clock at render time".
+	NowMS int64
+
+	// ClipPasted is the id of the clip this run pasted, 0 when none was. The
+	// ephemeral paste carries the body, so there is nothing to look up
+	// afterwards and this is only the record of what happened.
+	ClipPasted int64
+
 	// Deleted is the label this run DELETED. A deletion owes no telemetry row
 	// (it is neither a use nor a cancel) and nothing is pasted afterwards.
 	Deleted string
@@ -231,14 +295,32 @@ func maxLabelWidth(snippets []artifact.Snippet) int {
 	return w
 }
 
+// refilter recomputes the visible list for the CURRENT mode. The two
+// populations never meet: in shared mode Rank is not called at all, and in
+// browse mode RankShared is not.
 func (m *Model) refilter() {
+	if m.mode == modeShared {
+		m.filteredClips = RankShared(m.clips, m.query)
+		m.clampCursor()
+		return
+	}
 	m.filtered = Rank(m.all, m.query)
 	m.clampCursor()
 }
 
+// rowCount is how many rows the list currently holds — the mode's own
+// population. One definition, so the cursor clamp, the scroll window and the
+// header counts cannot disagree about which list is on screen.
+func (m *Model) rowCount() int {
+	if m.mode == modeShared {
+		return len(m.filteredClips)
+	}
+	return len(m.filtered)
+}
+
 func (m *Model) clampCursor() {
-	if m.cursor >= len(m.filtered) {
-		m.cursor = len(m.filtered) - 1
+	if m.cursor >= m.rowCount() {
+		m.cursor = m.rowCount() - 1
 	}
 	if m.cursor < 0 {
 		m.cursor = 0
@@ -274,6 +356,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return editStaged{Path: path, Err: err}
 				})
 			}
+			if _, ok := it.(FetchShared); ok {
+				n := next
+				cmds = append(cmds, func() tea.Msg {
+					clips, err := n.fx.FetchShared()
+					return sharedFetched{Clips: clips, Err: err}
+				})
+			}
+			if sc, ok := it.(SelectClip); ok {
+				sc := sc
+				n := next
+				cmds = append(cmds, func() tea.Msg {
+					return spawned{Err: n.fx.SpawnPasteClip(sc.ID, sc.Body, n.query, n.OpenLatencyMS)}
+				})
+			}
 			if cd, ok := it.(ConfirmDelete); ok {
 				cd := cd
 				n := next
@@ -283,6 +379,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return next, tea.Batch(cmds...)
+	case sharedFetched:
+		// 🔴 A FAILED FETCH IS NOT AN EMPTY LIST. The fetch is marked done
+		// either way (so the render stops saying "fetching…"), but on failure
+		// the clip list is left as it was and the REASON is put in the notice
+		// — the picker stays open, the catalog still works, and the operator
+		// is told why the shared view is unavailable instead of reading an
+		// empty list as "you have no clips".
+		m.fetching = false
+		m.fetched = true
+		if v.Err != nil {
+			m.fetchFailed = true
+			m.toast("shared clipboard: " + v.Err.Error())
+			m.notice = "shared clipboard: " + v.Err.Error()
+			return m, nil
+		}
+		m.fetchFailed = false
+		m.clips = v.Clips
+		m.notice = ""
+		m.cursor = 0
+		m.refilter()
+		return m, nil
 	case deleteDone:
 		if v.Err != nil {
 			m.confirmDelete = ""
@@ -384,7 +501,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if v.Err != nil {
 			m.SpawnFailed = true
 			if !m.rowEmitted {
-				emitFire(row(m, "abort"))
+				emitFire(row(m, "abort"), sourceFor(m))
 				m.rowEmitted = true
 			}
 			m.toast("paste helper failed to launch: " + v.Err.Error())
@@ -421,6 +538,19 @@ func (m Model) Lines() []string {
 		out = append(out, ui.StyNotice.Render(" "+truncate(m.notice, m.Width-1)))
 	}
 	start, end := m.window()
+	if m.mode == modeShared {
+		for i := start; i < end; i++ {
+			out = append(out, m.clipRowLine(i))
+		}
+		// 🔴 THE SHARED MODE HAS ITS OWN EMPTY LINE — three states, not one.
+		// See sharedBodyLine: a failed fetch must never land on browse mode's
+		// "(no match)".
+		if line := m.sharedBodyLine(); line != "" {
+			out = append(out, line)
+		}
+		out = append(out, m.sharedFooter())
+		return out
+	}
 	for i := start; i < end; i++ {
 		out = append(out, m.rowLine(i))
 	}
@@ -433,13 +563,28 @@ func (m Model) Lines() []string {
 
 // header is the title line: the tool name, the mode, and how much of the
 // catalog is showing. The key help lives in the footer, not here.
+// A THIRD mode word is a one-line extension of an asserted convention — the
+// header already names its mode and the counts, and a test pins that. In
+// shared mode the counts are the CLIP population's, not the catalog's: the two
+// lists are never mixed, and showing "2/27" over a list of clips would be a
+// lie about what is on screen.
 func (m Model) header() string {
-	mode := "browse"
+	modeWord := "browse"
+	if m.mode == modeShared {
+		modeWord = "shared"
+	}
 	if strings.TrimSpace(m.query) != "" {
-		mode = fmt.Sprintf("filter %q", m.query)
+		modeWord = fmt.Sprintf("filter %q", m.query)
+		if m.mode == modeShared {
+			modeWord = fmt.Sprintf("shared filter %q", m.query)
+		}
 	}
 	const title = " snip "
-	rest := fmt.Sprintf("%s · %d/%d", mode, len(m.filtered), len(m.all))
+	total := len(m.all)
+	if m.mode == modeShared {
+		total = len(m.clips)
+	}
+	rest := fmt.Sprintf("%s · %d/%d", modeWord, m.rowCount(), total)
 	return ui.StyTitle.Render(title) +
 		ui.StyDim.Render(truncate(rest, m.Width-lipgloss.Width(title)))
 }
@@ -454,9 +599,17 @@ func (m Model) footer() string {
 		ui.StyKey.Render("↑/↓") + d.Render(" move"),
 		ui.StyKey.Render("⏎") + d.Render(" paste"),
 		ui.StyKey.Render("ctrl+e") + d.Render(" edit"),
+		ui.StyKey.Render(SharedKey) + d.Render(" shared"),
 		ui.StyKey.Render("esc") + d.Render(" cancel"),
 		d.Render("type to filter"),
 	}
+	return joinToWidth(parts, sep, m.Width)
+}
+
+// joinToWidth joins the footer parts with sep, DROPPING trailing parts that do
+// not fit rather than wrapping — one implementation, so the browse and shared
+// footers cannot disagree about the layout the window maths assumes.
+func joinToWidth(parts []string, sep string, width int) string {
 	var b strings.Builder
 	b.WriteString(" ")
 	used := 1
@@ -465,7 +618,7 @@ func (m Model) footer() string {
 		if i > 0 {
 			add += lipgloss.Width(sep)
 		}
-		if used+add > m.Width {
+		if used+add > width {
 			break
 		}
 		if i > 0 {
@@ -542,8 +695,8 @@ func (m *Model) window() (int, int) {
 		start = m.cursor - h + 1
 	}
 	end := start + h
-	if end > len(m.filtered) {
-		end = len(m.filtered)
+	if end > m.rowCount() {
+		end = m.rowCount()
 	}
 	return start, end
 }
@@ -599,10 +752,34 @@ func (m Model) Step(msg tea.KeyPressMsg) (Model, []Intent) {
 		}
 		return m, nil
 	}
+	// 🔴 THE SHARED MODE IS A DISJOINT KEY TABLE, NOT A SET OF EXTRA ARMS.
+	// Nothing falls through to the browse table: a key that means something to
+	// the catalog list (ctrl+e's edit-and-land, which has no meaning for a row
+	// that came from another device) is SWALLOWED here rather than reaching
+	// code that would act on a catalog row the cursor is not even pointing at.
+	if m.mode == modeShared {
+		return m.stepShared(msg)
+	}
 	switch msg.String() {
 	case "esc", "ctrl+c":
 		m.Canceled, m.quit = true, true
 		return m, nil
+	case SharedKey:
+		// THE SECOND KEYPRESS. The mode switches now and the fetch is fired as
+		// an intent — so the list is on screen saying "fetching…" while the
+		// mesh round trip happens, instead of the keypress blocking the loop.
+		//
+		// The query is CLEARED on the way in: a filter typed against the
+		// catalog has no meaning over clips, and carrying it across would open
+		// the shared view already filtered by something the operator typed for
+		// a different population.
+		m.mode = modeShared
+		m.query = ""
+		m.cursor = 0
+		m.notice = ""
+		m.fetching = true
+		m.refilter()
+		return m, []Intent{FetchShared{}}
 	case "enter", "return":
 		if len(m.filtered) == 0 {
 			return m, nil // nothing to choose; Enter is inert on an empty list
@@ -698,6 +875,24 @@ type Launcher interface {
 	// An error means the landing was REFUSED and nothing was committed.
 	ApplyEdit(label, bodyFile string) error
 
+	// FetchShared reads the cross-device clipboard store over the mesh.
+	//
+	// 🔴 AN ERROR IS NOT AN EMPTY LIST. The implementation must map every
+	// transport, status and parse failure to an error with a reason in words;
+	// returning (nil, nil) for an unreachable store would render as "you have
+	// no clips", which is the one failure this feature is written against.
+	//
+	// 🔴 IT IS CALLED FROM THE SECOND KEYPRESS, NEVER FROM New(). See the
+	// FetchShared intent: an eager fetch would put a mesh round trip inside
+	// every picker open's measured latency.
+	FetchShared() ([]shared.Clip, error)
+
+	// SpawnPasteClip launches the EPHEMERAL paste for one clip: the body
+	// travels with the spawn (through a scratch file), so the detached helper
+	// never re-looks-up a row that a delete from another device may have
+	// removed in the meantime.
+	SpawnPasteClip(id int64, body, query string, openLatencyMS int64) error
+
 	// ApplyDelete lands the REMOVAL of a row, through the same landing script's
 	// explicit delete mode. Same refusals, same pipeline — and, like
 	// ApplyEdit, an error means nothing was committed.
@@ -751,10 +946,24 @@ func finish(m Model) int {
 		// row, exit 0 — an open that resolved to nothing is demand evidence,
 		// not an error. The abort path above already emitted its row.
 		if !m.rowEmitted {
-			emitFire(row(m, "cancel"))
+			emitFire(row(m, "cancel"), sourceFor(m))
 		}
 		return 0
 	}
+}
+
+// sourceFor is the telemetry SOURCE the picker's own rows carry: a row emitted
+// while the shared view is open is a clipboard row, not a catalog one.
+//
+// 🔴 IT IS NOT COSMETIC. snip-usage.py's prune verdicts read catalog rows as
+// demand for catalog snippets, and a clip query credited as term evidence can
+// rescue a genuinely DEAD snippet from the only prune verdict there is. A
+// cancel typed against the clip list is evidence about clips.
+func sourceFor(m Model) string {
+	if m.mode == modeShared {
+		return telemetry.SourceClip
+	}
+	return telemetry.SourceSnip
 }
 
 // row builds the payload both picker-side rows (cancel / spawn-abort) share:

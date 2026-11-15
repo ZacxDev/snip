@@ -78,10 +78,16 @@ func usage() {
                        opens in BROWSE order: most recently used first
       ctrl+e           edit the selected row's body, then land the change
                        through the landing script (see SNIP_REPO)
+      ctrl+g           the SHARED CLIPBOARD: the cross-device clip store, as a
+                       disjoint mode with its own list and its own filter
+                       (fetched on this keypress, never at open)
   snip paste           the detached paste helper (spawned by the picker)
       --label L        the snippet to paste, by its label (required)
       --body-file F    paste F's contents instead of the artifact's body
                        (the picker's edit path; F is consumed and removed)
+      --ephemeral      paste F's contents WITHOUT loading the catalog — the
+                       shared clipboard's path ({{clip}} is not expanded and
+                       the use is not recorded in the browse order)
   snip list            the catalog as a table (--category C to filter)
   snip search QUERY    ranked matches (the same matcher the picker runs)
   snip get LABEL       the raw body ({{clip}} unresolved)
@@ -99,6 +105,11 @@ Environment:
                                            UNSET means the edit/delete landing
                                            is unavailable and ctrl+e reports why
   SNIP_EDITOR / VISUAL / EDITOR            the ctrl+e editor (default nvim)
+  SNIP_SHARED_ENV                          path override for the shared-clipboard
+                                           config (default ~/.config/snip/shared.env,
+                                           mode 0600, holding SNIP_SHARED_URL and
+                                           SNIP_SHARED_TOKEN). THE PATH ONLY — the
+                                           token is never a command-line or nix value
 `)
 }
 
@@ -157,8 +168,18 @@ func runPicker() int {
 func runPaste(args []string) int {
 	label := ""
 	bodyFile := ""
+	ephemeral := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "--ephemeral":
+			// 🔴 A SEPARATE SPELLING, NOT A LOOSENED --body-file. The shared
+			// clipboard's body is by definition NOT in the catalog, so it hits
+			// overrideBody's unknown-label refusal — and that refusal is
+			// deliberate: an override that silently did nothing would paste the
+			// OLD body while the operator believes he pasted the new one. So an
+			// ephemeral paste builds its own ONE-ROW synthetic catalog instead
+			// of loading the artifact, and overrideBody keeps its guard intact.
+			ephemeral = true
 		case "--label":
 			if i+1 >= len(args) {
 				fmt.Fprintln(os.Stderr, "snip paste: --label needs a value")
@@ -189,6 +210,9 @@ func runPaste(args []string) int {
 	if label == "" {
 		fmt.Fprintln(os.Stderr, "snip paste: --label is required")
 		return 2
+	}
+	if ephemeral {
+		return runPasteEphemeral(label, bodyFile)
 	}
 	snippets := loadOrDie()
 	if bodyFile != "" {
@@ -221,6 +245,42 @@ func runPaste(args []string) int {
 	// bookkeeping outranking the thing it exists to rank.
 	if path, err := recent.Path(); err == nil {
 		_ = recent.Touch(path, label, time.Now())
+	}
+	return 0
+}
+
+// runPasteEphemeral is the shared clipboard's paste: the body is the file's
+// contents and the catalog is never loaded at all.
+//
+// 🔴 THE ARTIFACT IS NOT READ. A clip is not a catalog row — loading the
+// catalog would only create the chance of a label collision between a clip id
+// and a snippet label, and it would make the paste fail on a machine whose
+// snippets.json is broken for reasons that have nothing to do with this clip.
+//
+// 🔴 NO recent.Touch. recent.json is bounded to 200 entries and sized for a
+// ~30-row catalog; feeding a chronological clipboard into it would churn the
+// bound and evict real catalog recency, silently degrading the browse order
+// the picker opens on.
+func runPasteEphemeral(label, bodyFile string) int {
+	if bodyFile == "" {
+		fmt.Fprintln(os.Stderr, "snip paste: --ephemeral requires --body-file")
+		return 2
+	}
+	// The file is the picker's scratch: consumed here, removed here, so a
+	// successful paste leaves nothing behind in /tmp.
+	defer os.Remove(bodyFile)
+	raw, err := os.ReadFile(bodyFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "snip paste: --body-file: %v\n", err)
+		return 1
+	}
+	snippets := []artifact.Snippet{{Label: label, Body: string(raw)}}
+	req := paste.RequestFromEnv(label)
+	req.Ephemeral = true
+	res := paste.Run(effects.Live{}, snippets, req)
+	if res.Err != nil {
+		fmt.Fprintf(os.Stderr, "snip paste: %v\n", res.Err)
+		return 1
 	}
 	return 0
 }
