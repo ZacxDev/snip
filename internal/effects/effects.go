@@ -441,11 +441,39 @@ func (Live) SpawnPaste(label, query string, openLatencyMS int64, bodyFile string
 // 🔴 EVERY FAILURE IS AN ERROR, NEVER AN EMPTY LIST: an unreadable store and
 // an empty store are different states and the picker renders them differently.
 func (Live) FetchShared() ([]shared.Clip, error) {
+	c, err := sharedClient()
+	if err != nil {
+		return nil, err
+	}
+	return c.Rows(shared.DefaultLimit)
+}
+
+// DeleteClip implements picker.Launcher: remove one clip from the store.
+//
+// 🔴 A 404 IS SUCCESS AND THAT DECISION LIVES IN THE CLIENT, not here and not
+// in the picker — the row is gone either way, which is what was asked for, and
+// one place deciding it is what keeps the read path and the write path from
+// disagreeing about what "already deleted" means.
+//
+// 🔴 NO CONFIRMATION LIVES HERE. This is the world call; the y/N prompt is the
+// picker's, exactly as the catalog delete's is.
+func (Live) DeleteClip(id int64) error {
+	c, err := sharedClient()
+	if err != nil {
+		return err
+	}
+	return c.Delete(id)
+}
+
+// sharedClient resolves the operator's config and builds the client — ONE
+// place, so the read and the delete cannot end up pointed at different
+// endpoints, or report an unconfigured machine two different ways.
+func sharedClient() (*shared.Client, error) {
 	cfg, err := shared.Load()
 	if err != nil {
 		return nil, err
 	}
-	return shared.New(cfg).Rows(shared.DefaultLimit)
+	return shared.New(cfg), nil
 }
 
 // SpawnPasteClip implements picker.Launcher: `self paste --ephemeral

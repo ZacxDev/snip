@@ -253,3 +253,125 @@ func TestAge(t *testing.T) {
 		}
 	}
 }
+
+// 🔴 DELETE'S WIRE SHAPE, PINNED LITERALLY: the method, the path with the id,
+// and the bearer header — read from the request the stub saw, never from the
+// implementation.
+func TestDeleteSendsTheIdAsAnAuthenticatedDELETE(t *testing.T) {
+	var gotMethod, gotPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath, gotAuth = r.Method, r.URL.RequestURI(), r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	if err := New(stubCfg(srv.URL)).Delete(42); err != nil {
+		t.Fatalf("a 204 must be success: %v", err)
+	}
+	if gotMethod != "DELETE" {
+		t.Errorf("method = %q, want DELETE", gotMethod)
+	}
+	if gotPath != "/v1/clips/42" {
+		t.Errorf("path = %q, want /v1/clips/42", gotPath)
+	}
+	if gotAuth != "Bearer test-token-not-a-real-credential" {
+		t.Errorf("Authorization = %q — every route that touches a clip takes the bearer token", gotAuth)
+	}
+}
+
+// 🔴 A 404 IS SUCCESS, NOT AN ERROR. The row is gone either way, which is what
+// the operator asked for: the clip may have been deleted from the phone, or by
+// a second press against a list fetched before that happened. Reporting it as
+// a failure would tell the operator a deletion was refused while the store
+// agrees with him.
+//
+// The NEGATIVE CONTROL is in the same test: a 403 from the same client, the
+// same route and the same stub IS an error — so the nil above is about the
+// status code and not about Delete being unable to fail.
+func TestA404IsSuccessAndA403IsNot(t *testing.T) {
+	code := http.StatusNotFound
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(`{"error":"not_found","detail":"no clip with that id"}`))
+	}))
+	defer srv.Close()
+	c := New(stubCfg(srv.URL))
+
+	if err := c.Delete(7); err != nil {
+		t.Fatalf("a 404 must be success — the row is gone either way: %v", err)
+	}
+	code = http.StatusForbidden
+	if err := c.Delete(7); err == nil {
+		t.Fatal("a 403 must be an error — this control proves the 404 above is about the code")
+	}
+}
+
+// Every other non-2xx carries the service's own reason, the way the list
+// route's does. A refused delete is the one case the picker must NOT treat as
+// a removal, so the message has to say what happened.
+func TestARefusedDeleteCarriesTheReason(t *testing.T) {
+	const detail = "the store is read-only while a backup is running"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"store_unwritable","detail":"` + detail + `"}`))
+	}))
+	defer srv.Close()
+	err := New(stubCfg(srv.URL)).Delete(7)
+	if err == nil {
+		t.Fatal("a 503 must be an error")
+	}
+	if !strings.Contains(err.Error(), detail) {
+		t.Errorf("message = %q, want the service's own detail %q verbatim", err, detail)
+	}
+	if !strings.Contains(err.Error(), "503") {
+		t.Errorf("message = %q, want the status code too", err)
+	}
+}
+
+// An unreachable store is an error naming the cause, and the stdlib's
+// `Delete "<url>": ` wrapper is dropped — the prefix test this used to do
+// matched `Get ` only, so a DELETE would have carried the URL twice.
+func TestAnUnreachableStoreFailsTheDeleteWithTheCause(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+	err := New(stubCfg(deadURL)).Delete(7)
+	if err == nil {
+		t.Fatal("an unreachable store must fail the delete, never report success")
+	}
+	if !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("message = %q, want it to say the store is unreachable", err)
+	}
+	if !strings.Contains(err.Error(), "refused") && !strings.Contains(err.Error(), "connect") {
+		t.Errorf("message = %q, want the transport cause", err)
+	}
+	if strings.Contains(err.Error(), `Delete "`) {
+		t.Errorf("message = %q still carries the stdlib's method/URL wrapper", err)
+	}
+}
+
+// 🔴 THE TOKEN IS NEVER IN A DELETE'S FAILURE MESSAGE EITHER — the same
+// property as the list route's, pinned on the write path because that is where
+// a new message was added.
+func TestNoDeleteFailureCarriesTheToken(t *testing.T) {
+	const token = "s3cret-token-value-do-not-print"
+	var sawToken bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawToken = sawToken || r.Header.Get("Authorization") == "Bearer "+token
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"store_unreadable","detail":"the store could not be read"}`))
+	}))
+	defer srv.Close()
+	err := New(Config{URL: srv.URL, Token: token}).Delete(7)
+	if err == nil {
+		t.Fatal("a 500 must be an error")
+	}
+	// POSITIVE CONTROL: the request really did carry the token, so a clean
+	// message is about redaction and not about the token being absent.
+	if !sawToken {
+		t.Fatal("the stub never saw the token on the wire — this guard would pass vacuously")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("the failure message leaks the token: %q", err)
+	}
+}

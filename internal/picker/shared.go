@@ -17,6 +17,7 @@
 package picker
 
 import (
+	"fmt"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -44,6 +45,37 @@ const (
 // it is "\t" the key would grow the query, which is the exact failure this
 // constant exists to avoid.
 const SharedKey = "ctrl+g"
+
+// DeleteKey is the shared mode's delete chord. It REMOVES THE HIGHLIGHTED CLIP
+// FROM THE STORE, on every device, with no undo: the service has no trash and
+// decision 7 (no expiry, manual delete only) makes this the only hygiene
+// mechanism the store has.
+//
+// 🔴 WHY ctrl+x AND WHY IT CANNOT FIRE BY ACCIDENT — four properties, and the
+// confirm is only one of them:
+//
+//  1. It is a MODIFIED chord, so it cannot arrive from ordinary typing. Every
+//     plain printable key is taken by the filter (Step's trailing
+//     `Mod == 0` arm), which is the same reason SharedKey is a chord.
+//  2. It is NOT a readline text operation. This list is a text-entry box, and
+//     the keys an operator's hands produce in one without meaning to are the
+//     readline editing chords — ctrl+w (kill word), ctrl+u (kill line),
+//     ctrl+k (kill to end), ctrl+d (delete char / EOF), ctrl+h (backspace),
+//     ctrl+a/ctrl+e (line ends). A bare `d` or `x` is worse still: it is one
+//     keystroke of a filter query. ctrl+x has no editing meaning on an input
+//     line (in readline it is a keymap PREFIX, which does nothing alone), so
+//     no muscle memory sends it here.
+//  3. It is not adjacent in function to any key this mode already uses —
+//     ctrl+p/ctrl+n move, ctrl+c cancels, ctrl+g entered the mode — so a
+//     mistyped navigation chord cannot land on it.
+//  4. And it only ASKS. The destructive call is behind a modal y/N that names
+//     the clip, which is the precedent this file's own package already set for
+//     a destructive action with no undo (confirmDelete, picker.go).
+//
+// ⚠ `tab` is NOT used here either, for the reason SharedKey records: its Text
+// in this bubbletea version was never measured, and a ctrl+<letter> chord is
+// the family `TestModifiedKeysDoNotGrowQuery` already proves carries Mod != 0.
+const DeleteKey = "ctrl+x"
 
 // sharedFetched reports the mesh fetch back into the loop.
 //
@@ -108,13 +140,39 @@ func clipMatches(body string, tokens []string) bool {
 // key it does not name is swallowed, and there is no arm that falls through to
 // the browse table.
 func (m Model) stepShared(msg tea.KeyPressMsg) (Model, []Intent) {
+	// 🔴 THE DELETE PROMPT IS MODAL, AND IT IS THIS MODE'S OWN. While it is up
+	// only its own answers are read and everything else is SWALLOWED — a
+	// keystroke meant for the prompt must never become a filter character or,
+	// worse, the Enter that pastes something. It is handled HERE rather than in
+	// Step's catalog prompt because answering `y` there lands a git commit
+	// against a catalog label; the two populations do not share a prompt any
+	// more than they share a key table.
+	if m.confirmClipID != 0 {
+		switch msg.String() {
+		case "y", "Y":
+			return m, []Intent{DeleteClip{ID: m.confirmClipID}}
+		case "n", "N", "esc":
+			// Backs out of the DELETION, not out of the mode: the operator
+			// asked about one row and is answering no. A second esc returns to
+			// browse as usual.
+			m.confirmClipID = 0
+			m.notice = "deletion cancelled — the clip is still in the store"
+			return m, nil
+		case "ctrl+c":
+			m.Canceled, m.quit = true, true
+			return m, nil
+		}
+		return m, nil
+	}
 	switch msg.String() {
 	case "esc":
 		// BACK TO BROWSE, not out of the picker. The operator asked for one
 		// thing (the shared list) and esc undoes that one thing; a second esc
-		// closes the TUI as usual. The clips stay in the model, so coming back
-		// does not re-fetch — the store is append-only-ish and a second mesh
-		// round trip per toggle would be paid for nothing.
+		// closes the TUI as usual. The fetched clips are LEFT in the model —
+		// nothing clears them — but coming back through ctrl+g re-fetches
+		// unconditionally, so what is on screen is always a fresh read rather
+		// than the rows from the previous visit. The kept clips are what the
+		// catalog-list round-trip test observes, not a cache the mode reads.
 		m.mode = modeBrowse
 		m.query = ""
 		m.cursor = 0
@@ -143,6 +201,33 @@ func (m Model) stepShared(msg tea.KeyPressMsg) (Model, []Intent) {
 		if m.cursor < len(m.filteredClips)-1 {
 			m.cursor++
 		}
+		return m, nil
+	case DeleteKey:
+		// ASK about removing the highlighted clip. Inert on an empty list, like
+		// Enter: there is no row to ask about.
+		//
+		// 🔴 NOTHING IS CALLED HERE. The prompt is raised and the destructive
+		// DELETE waits for `y` — see DeleteKey's own comment for why that is
+		// the fourth of four reasons this key cannot cost the operator data by
+		// accident.
+		if len(m.filteredClips) == 0 {
+			return m, nil
+		}
+		c := m.filteredClips[m.cursor]
+		m.confirmClipID = c.ID
+		// The prompt NAMES THE ROW — its id and a one-line preview of its body
+		// — so the answer cannot be about a different clip than the one under
+		// the cursor, the property the catalog prompt's label spelling has.
+		//
+		// 🔴 THE `[y/N]` LEADS, unlike the catalog prompt's trailing one. The
+		// notice line is TRUNCATED to the terminal width (Lines renders it
+		// through truncate), and with the ask at the end an 80-column terminal
+		// cut it off — measured, as the first run of this feature's own test.
+		// A destructive prompt whose answer shape is the part that disappears
+		// is worse than one with a short preview, so the preview is what gives
+		// way.
+		m.notice = fmt.Sprintf("[y/N] delete clip %d from the shared store — %q · no undo",
+			c.ID, truncate(oneLine(c.Body), 32))
 		return m, nil
 	case "backspace":
 		if r := []rune(m.query); len(r) > 0 {
@@ -220,6 +305,7 @@ func (m Model) sharedFooter() string {
 	parts := []string{
 		ui.StyKey.Render("↑/↓") + d.Render(" move"),
 		ui.StyKey.Render("⏎") + d.Render(" paste"),
+		ui.StyKey.Render(DeleteKey) + d.Render(" delete"),
 		ui.StyKey.Render("esc") + d.Render(" back"),
 		d.Render("type to filter"),
 	}

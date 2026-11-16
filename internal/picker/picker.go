@@ -83,6 +83,20 @@ type SelectClip struct {
 	Body string
 }
 
+// DeleteClip says "the operator confirmed removing this clip from the store" —
+// Update turns it into the DELETE call.
+//
+// 🔴 IT IS ONLY EVER RETURNED FROM THE CONFIRMED ANSWER, never from the
+// keypress that asks. The store has no trash and the service has no undo, so
+// the destructive call is one y/N away from the key, exactly as the catalog's
+// ConfirmDelete is.
+//
+// 🔴 AND IT IS THE ONLY THING THAT REMOVES A ROW. Nothing in the model drops a
+// clip locally: the list is re-read from the store after the delete lands, so a
+// REFUSED delete structurally cannot show the operator a deletion that did not
+// happen.
+type DeleteClip struct{ ID int64 }
+
 // Intent is the intent sum type the pure Step returns (unexported marker
 // method, stt-voice shape).
 type Intent interface{ intentName() }
@@ -92,6 +106,7 @@ func (Edit) intentName()          {}
 func (ConfirmDelete) intentName() {}
 func (FetchShared) intentName()   {}
 func (SelectClip) intentName()    {}
+func (DeleteClip) intentName()    {}
 
 // spawned reports the helper-spawn outcome back into the loop.
 type spawned struct{ Err error }
@@ -126,6 +141,13 @@ type editRead struct {
 
 // deleteDone reports the deletion landing back into the loop.
 type deleteDone struct{ Err error }
+
+// clipDeleted reports the store's answer to a DELETE back into the loop.
+//
+// 🔴 A 404 IS NOT CARRIED HERE AS AN ERROR. The client maps it to success —
+// the row is gone either way, which is what was asked for — so this message's
+// Err means the row may still be there, and the list is NOT touched on one.
+type clipDeleted struct{ Err error }
 
 // --- ranking (ONE implementation, shared with the search CLI) ----------------
 
@@ -240,6 +262,17 @@ type Model struct {
 	filteredClips []shared.Clip
 	fetching      bool
 	fetched       bool
+
+	// confirmClipID is the clip awaiting a y/N answer, set by the shared
+	// mode's delete chord. 0 is "no prompt up" — the same sentinel ClipPasted
+	// uses, and the store's ids are a positive autoincrement so 0 is never a
+	// row.
+	//
+	// 🔴 IT IS NOT confirmDelete. That field is a catalog LABEL and its y arm
+	// lands a catalog deletion through the landing script; sharing it would
+	// mean a prompt raised over a clip answering `y` into a git commit. Two
+	// populations, two prompts — the same reason the key tables are disjoint.
+	confirmClipID int64
 
 	// fetchFailed is "the last fetch returned a reason, not rows".
 	//
@@ -357,10 +390,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				})
 			}
 			if _, ok := it.(FetchShared); ok {
+				cmds = append(cmds, fetchSharedCmd(next))
+			}
+			if dc, ok := it.(DeleteClip); ok {
+				dc := dc
 				n := next
 				cmds = append(cmds, func() tea.Msg {
-					clips, err := n.fx.FetchShared()
-					return sharedFetched{Clips: clips, Err: err}
+					return clipDeleted{Err: n.fx.DeleteClip(dc.ID)}
 				})
 			}
 			if sc, ok := it.(SelectClip); ok {
@@ -400,6 +436,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cursor = 0
 		m.refilter()
 		return m, nil
+	case clipDeleted:
+		m.confirmClipID = 0
+		if v.Err != nil {
+			// 🔴 THE LIST IS LEFT EXACTLY AS IT WAS. A refused delete that
+			// dropped the row would show a deletion that did not happen — and
+			// this is not derived from a count: nothing anywhere removes a clip
+			// locally, so the only way a row leaves the list is a re-read of
+			// the store below. The reason goes where fetchFailed's does.
+			m.toast("clip delete failed: " + v.Err.Error())
+			m.notice = "clip delete failed: " + v.Err.Error()
+			return m, nil
+		}
+		// 🔴 RE-LIST RATHER THAN REMOVE LOCALLY. A local removal would be one
+		// render faster and would be the picker's OWN opinion of what the store
+		// now holds — which can disagree with it (another device's capture, a
+		// bump, a delete from the phone). The re-fetch is the call the ctrl+g
+		// arm already makes, so there is one definition of "what is in the
+		// store" and the delete cannot drift from it. At one person's clipboard
+		// scale, over the mesh, it costs a 2s-bounded round trip the operator
+		// already pays on every open of this mode.
+		m.fetching = true
+		m.notice = ""
+		return m, fetchSharedCmd(m)
 	case deleteDone:
 		if v.Err != nil {
 			m.confirmDelete = ""
@@ -514,6 +573,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Width, m.Height = max(v.Width, 1), max(v.Height, 1)
 	}
 	return m, nil
+}
+
+// fetchSharedCmd is the mesh read, as a cmd. ONE definition, used by both the
+// second keypress and the re-list after a delete lands — so "what the store
+// holds" cannot come to mean two different things at two call sites.
+func fetchSharedCmd(m Model) tea.Cmd {
+	return func() tea.Msg {
+		clips, err := m.fx.FetchShared()
+		return sharedFetched{Clips: clips, Err: err}
+	}
 }
 
 // View implements tea.Model.
@@ -897,6 +966,19 @@ type Launcher interface {
 	// explicit delete mode. Same refusals, same pipeline — and, like
 	// ApplyEdit, an error means nothing was committed.
 	ApplyDelete(label string) error
+
+	// DeleteClip removes one clip from the shared store.
+	//
+	// 🔴 A 404 MUST BE SUCCESS. The row is gone either way, which is what the
+	// operator asked for: the clip may have been deleted from the phone, or
+	// by a second press against a list fetched before that happened. An
+	// implementation that reports it as a failure makes the picker say a
+	// deletion was refused when the store agrees with the operator.
+	//
+	// 🔴 EVERY OTHER FAILURE IS AN ERROR WITH ITS REASON IN WORDS. The model
+	// removes nothing locally, so an error leaves the row on screen — which
+	// is correct, because it may still be in the store.
+	DeleteClip(id int64) error
 
 	// Toast surfaces a failure in words. Best effort.
 	Toast(msg string)

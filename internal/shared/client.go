@@ -2,6 +2,7 @@ package shared
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -127,16 +128,62 @@ func (c *Client) Search(query string, limit int) ([]Clip, error) {
 	return resp.Clips, nil
 }
 
-// get performs one authenticated GET and returns the body, mapping every
-// failure to a sentence.
+// Delete removes one clip from the store, by the id the list route served.
+//
+// 🔴 A 404 IS SUCCESS, NOT A FAILURE. The operator asked for the row to be
+// gone, and a store answering "no such id" has already granted exactly that —
+// the clip was deleted from the phone, or by a second press of this key
+// against a list fetched before that happened. Reporting it as an error would
+// show a failure for the outcome that was asked for, and would leave a row on
+// screen that no longer exists anywhere. This is the service's own contract
+// (DELETE /v1/clips/{id} → 204, and 404 for an id that is already gone), so it
+// is read here rather than discovered in the picker.
+//
+// 🔴 EVERY OTHER NON-2xx IS AN ERROR WITH ITS REASON, and the caller must NOT
+// remove the row on one — a dropped row after a refused delete would show the
+// operator a deletion that did not happen.
+func (c *Client) Delete(id int64) error {
+	u := strings.TrimRight(c.cfg.URL, "/") + "/v1/clips/" + strconv.FormatInt(id, 10)
+	body, code, err := c.do(http.MethodDelete, u)
+	if err != nil {
+		return err
+	}
+	switch code {
+	case http.StatusNoContent, http.StatusOK, http.StatusNotFound:
+		return nil
+	}
+	return statusError(code, body)
+}
+
+// get performs one authenticated GET and returns the body of a 200, mapping
+// every failure to a sentence.
+func (c *Client) get(u string) ([]byte, error) {
+	body, code, err := c.do(http.MethodGet, u)
+	if err != nil {
+		return nil, err
+	}
+	if code != http.StatusOK {
+		return nil, statusError(code, body)
+	}
+	return body, nil
+}
+
+// do performs one authenticated request and hands back the body AND the status
+// code, so each route decides for itself which codes are success — the list
+// route wants 200 only; delete also accepts 204 and 404. A transport or
+// request-construction failure comes back as an error; a status does not.
+//
+// 🔴 ONE PLACE BUILDS THE AUTHENTICATED REQUEST. Open-coding the header per
+// method is how one of them ends up unauthenticated, or how one of them starts
+// printing the credential.
 //
 // 🔴 THE TOKEN IS NEVER IN A MESSAGE. The URL is, because the operator needs
 // to know which endpoint failed; the Authorization header is not, and the
 // request is never dumped.
-func (c *Client) get(u string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, u, nil)
+func (c *Client) do(method, u string) ([]byte, int, error) {
+	req, err := http.NewRequest(method, u, nil)
 	if err != nil {
-		return nil, fmt.Errorf("bad clip store URL %q: %v", c.cfg.URL, err)
+		return nil, 0, fmt.Errorf("bad clip store URL %q: %v", c.cfg.URL, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
 	req.Header.Set("Accept", "application/json")
@@ -144,27 +191,29 @@ func (c *Client) get(u string) ([]byte, error) {
 	if err != nil {
 		// A transport failure's own text names the host and the cause
 		// (connection refused, i/o timeout); it is the message.
-		return nil, fmt.Errorf("clip store unreachable: %v", transportMessage(err))
+		return nil, 0, fmt.Errorf("clip store unreachable: %v", transportMessage(err))
 	}
 	defer resp.Body.Close()
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if resp.StatusCode != http.StatusOK {
-		return nil, statusError(resp.StatusCode, body)
+	if readErr != nil && resp.StatusCode == http.StatusOK {
+		return nil, resp.StatusCode, fmt.Errorf("clip store: reading the answer: %v", readErr)
 	}
-	if readErr != nil {
-		return nil, fmt.Errorf("clip store: reading the answer: %v", readErr)
-	}
-	return body, nil
+	return body, resp.StatusCode, nil
 }
 
-// transportMessage strips the stdlib's `Get "<url>": ` prefix, which repeats a
-// URL the caller already names, while keeping the cause.
+// transportMessage drops the stdlib's `<Method> "<url>": ` wrapper, which
+// repeats a URL the caller already names, while keeping the cause.
+//
+// 🔴 IT UNWRAPS THE TYPE, NOT THE SPELLING. A prefix test for `Get ` was
+// correct while GET was the only method; DELETE renders `Delete "<url>": …`
+// and would have gone unstripped. *url.Error is what net/http actually
+// returns, and its Err is the cause for every method.
 func transportMessage(err error) string {
-	msg := err.Error()
-	if i := strings.Index(msg, ": "); i > 0 && strings.HasPrefix(msg, "Get ") {
-		return strings.TrimSpace(msg[i+2:])
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		return strings.TrimSpace(ue.Err.Error())
 	}
-	return msg
+	return err.Error()
 }
 
 // statusError turns a non-200 into a sentence. The service's own `detail` is

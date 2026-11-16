@@ -41,6 +41,25 @@ type fakeLauncher struct {
 	clipIDs    []int64       // ids handed to SpawnPasteClip
 	clipBodies []string      // bodies handed to SpawnPasteClip
 	clipQuery  []string      // the SNIP_QUERY handed to each clip spawn
+
+	// the clip DELETE path
+	clipDeletes  []int64 // ids handed to DeleteClip, in order
+	clipDeleteEr error   // ...or the reason the store refused
+	// clipsAfterDelete, when non-nil, is what FetchShared answers once a
+	// delete has landed — so a test can prove the list is RE-READ from the
+	// store rather than edited locally.
+	clipsAfterDelete []shared.Clip
+}
+
+func (f *fakeLauncher) DeleteClip(id int64) error {
+	f.clipDeletes = append(f.clipDeletes, id)
+	if f.clipDeleteEr != nil {
+		return f.clipDeleteEr
+	}
+	if f.clipsAfterDelete != nil {
+		f.clips = f.clipsAfterDelete
+	}
+	return nil
 }
 
 func (f *fakeLauncher) FetchShared() ([]shared.Clip, error) {

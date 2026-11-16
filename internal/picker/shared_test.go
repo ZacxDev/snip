@@ -456,3 +456,340 @@ func TestEnterIsInertOnAnEmptySharedList(t *testing.T) {
 		t.Fatalf("Enter on an empty clip list produced %+v / ClipPasted=%d", intents, m.ClipPasted)
 	}
 }
+
+// --- the delete affordance ----------------------------------------------------
+//
+// 🔴 THESE ARE INVARIANT GUARDS ON A NEW AFFORDANCE, NOT REGRESSION COVERAGE,
+// with one exception noted on it. Each was watched to go red against a
+// deliberately broken copy of the thing it guards, with that guard's own
+// message; the matrix is in the PR description.
+
+// drive runs one message through Update and then every message its cmd
+// produces, recursively — so a confirmed delete AND the re-list it triggers
+// both run, which is the behaviour under test.
+func drive(m Model, msg tea.Msg) Model {
+	next, cmd := updCmd(m, msg)
+	for _, out := range runCmd(cmd) {
+		next = drive(next, out)
+	}
+	return next
+}
+
+// 🔴 THE DELETE CHORD ONLY ASKS. It must call NOTHING: this removes the
+// operator's data from every device and the store has no trash, so the
+// destructive call waits behind a y/N that names the row.
+//
+// The three controls in here are what make the silence meaningful: the chord
+// does not type itself into the filter, a PLAIN key of the same letter does
+// grow the filter instead of prompting (so the guard is about the modifier),
+// and the prompt is raised for the row UNDER THE CURSOR rather than the first.
+func TestTheDeleteChordOnlyAsks(t *testing.T) {
+	fx := &fakeLauncher{clips: clipRows}
+	m := enterShared(t, fx)
+	m, intents := m.Step(ctrl('x'))
+	if len(intents) != 0 {
+		t.Fatalf("%s produced %+v — it must ask, not act", DeleteKey, intents)
+	}
+	if len(fx.clipDeletes) != 0 {
+		t.Fatalf("%s reached the store: %v", DeleteKey, fx.clipDeletes)
+	}
+	if m.confirmClipID != 9 {
+		t.Fatalf("confirmClipID = %d, want 9 — the row under the cursor", m.confirmClipID)
+	}
+	if m.query != "" {
+		t.Errorf("query = %q — the chord typed itself into the filter", m.query)
+	}
+	screen := strings.Join(bareLines(m), "\n")
+	if !strings.Contains(screen, "9") || !strings.Contains(screen, "[y/N]") {
+		t.Errorf("the prompt does not name the clip and ask: %q", screen)
+	}
+
+	// CONTROL 1: the cursor decides which row is asked about.
+	second := enterShared(t, &fakeLauncher{clips: clipRows})
+	second = upd(second, tea.KeyPressMsg{Code: tea.KeyDown})
+	second, _ = second.Step(ctrl('x'))
+	if second.confirmClipID != 8 {
+		t.Errorf("confirmClipID = %d after one ↓, want 8", second.confirmClipID)
+	}
+
+	// CONTROL 2: an UNMODIFIED 'x' filters and raises NO prompt, so the guard
+	// above is about the modifier and not about Step ignoring the key.
+	plain := typeStr(enterShared(t, &fakeLauncher{clips: clipRows}), "x")
+	if plain.query != "x" {
+		t.Errorf("a plain x did not reach the filter (%q) — this control proves nothing", plain.query)
+	}
+	if plain.confirmClipID != 0 {
+		t.Errorf("a plain x raised the delete prompt (id=%d)", plain.confirmClipID)
+	}
+}
+
+// The chord is inert on an empty list, like Enter: there is no row to ask about.
+func TestTheDeleteChordIsInertOnAnEmptySharedList(t *testing.T) {
+	fx := &fakeLauncher{clips: nil}
+	m := enterShared(t, fx)
+	m, intents := m.Step(ctrl('x'))
+	if len(intents) != 0 || m.confirmClipID != 0 {
+		t.Fatalf("%s on an empty clip list produced %+v / confirmClipID=%d",
+			DeleteKey, intents, m.confirmClipID)
+	}
+}
+
+// 🔴 THE CHORD BELONGS TO THE SHARED MODE ONLY — the key tables are disjoint,
+// and this one is destructive, so in browse mode it must do nothing at all
+// (not delete a clip, not land a catalog deletion, not grow the query).
+func TestTheDeleteChordDoesNothingInBrowseMode(t *testing.T) {
+	fx := &fakeLauncher{clips: clipRows}
+	m, intents := newModel(fx).Step(ctrl('x'))
+	if len(intents) != 0 {
+		t.Fatalf("%s in browse mode produced %+v, want nothing", DeleteKey, intents)
+	}
+	if m.confirmClipID != 0 || m.confirmDelete != "" {
+		t.Errorf("it raised a prompt in browse mode: clip=%d label=%q", m.confirmClipID, m.confirmDelete)
+	}
+	if m.query != "" {
+		t.Errorf("query = %q", m.query)
+	}
+	if len(fx.clipDeletes) != 0 || len(fx.deleted) != 0 {
+		t.Fatalf("it reached a delete path from browse mode: clips=%v labels=%v",
+			fx.clipDeletes, fx.deleted)
+	}
+	// POSITIVE CONTROL: the SAME chord in shared mode DOES raise the prompt,
+	// so the silence above is about the mode and not about a dead key.
+	asked, _ := enterShared(t, fx).Step(ctrl('x'))
+	if asked.confirmClipID == 0 {
+		t.Fatal("the chord raised no prompt in shared mode either — this control proves nothing")
+	}
+}
+
+// 🔴 THE CONFIRMED DELETE CALLS THE STORE WITH THE CLIP'S OWN ID, AND THE LIST
+// IS THEN RE-READ FROM THE STORE RATHER THAN EDITED LOCALLY. The fake answers
+// the second fetch with the store's new contents, so a model that spliced the
+// row out of its own slice instead would still be holding the OLD list — and
+// would miss the row the store gained in the meantime.
+func TestAConfirmedDeleteRemovesTheClipAndReReadsTheStore(t *testing.T) {
+	fx := &fakeLauncher{
+		clips: clipRows,
+		clipsAfterDelete: []shared.Clip{
+			{ID: 8, Body: "Ärger über Äpfel", Device: "phone", CreatedAt: 1_699_999_000_000},
+			{ID: 7, Body: "a multi\nline body", Device: "laptop", CreatedAt: 1_699_000_000_000},
+			{ID: 11, Body: "captured while the prompt was up", Device: "phone", CreatedAt: 1_700_000_500_000},
+		},
+	}
+	m := enterShared(t, fx)
+	m, _ = m.Step(ctrl('x'))
+	m = drive(m, tea.KeyPressMsg{Code: 'y', Text: "y"})
+
+	if len(fx.clipDeletes) != 1 || fx.clipDeletes[0] != 9 {
+		t.Fatalf("DeleteClip calls = %v, want exactly [9]", fx.clipDeletes)
+	}
+	if fx.fetches != 2 {
+		t.Fatalf("fetches = %d, want 2 — the list must be re-read after the delete lands", fx.fetches)
+	}
+	ids := clipIDsOf(m.filteredClips)
+	if len(ids) != 3 || ids[0] != 8 || ids[1] != 7 || ids[2] != 11 {
+		t.Fatalf("list = %v, want the store's new answer [8 7 11] — a local splice would be [8 7]", ids)
+	}
+	if m.confirmClipID != 0 {
+		t.Errorf("the prompt is still up (id=%d) after the delete landed", m.confirmClipID)
+	}
+	if m.quit || m.Canceled {
+		t.Error("a delete must leave the picker open — the operator may delete another row")
+	}
+	if m.Deleted != "" {
+		t.Errorf("Deleted = %q — that field is the CATALOG label; a clip deletion owes no catalog state", m.Deleted)
+	}
+}
+
+// `n` (and esc) declines: nothing is called and the row stays.
+func TestDecliningTheDeleteCallsNothing(t *testing.T) {
+	for _, key := range []tea.KeyPressMsg{
+		{Code: 'n', Text: "n"},
+		{Code: tea.KeyEscape},
+	} {
+		fx := &fakeLauncher{clips: clipRows}
+		m := enterShared(t, fx)
+		m, _ = m.Step(ctrl('x'))
+		m = drive(m, key)
+		if len(fx.clipDeletes) != 0 {
+			t.Fatalf("%v reached the store: %v", key, fx.clipDeletes)
+		}
+		if m.confirmClipID != 0 {
+			t.Errorf("%v left the prompt up (id=%d)", key, m.confirmClipID)
+		}
+		if ids := clipIDsOf(m.filteredClips); len(ids) != 3 {
+			t.Errorf("%v changed the list: %v", key, ids)
+		}
+		if m.mode != modeShared {
+			t.Errorf("%v left the shared mode — it backs out of the DELETION, not the mode", key)
+		}
+		if fx.fetches != 1 {
+			t.Errorf("%v re-fetched (%d) — nothing changed in the store", key, fx.fetches)
+		}
+	}
+}
+
+// 🔴 THE CLIP PROMPT IS MODAL. A keystroke meant for it must never become a
+// filter character or, worse, the Enter that pastes something. (The CATALOG
+// prompt's own modality is TestTheDeletePromptIsModal in picker_test.go —
+// these are two prompts, deliberately.)
+func TestTheClipDeletePromptIsModal(t *testing.T) {
+	fx := &fakeLauncher{clips: clipRows}
+	m := enterShared(t, fx)
+	m, _ = m.Step(ctrl('x'))
+
+	typed, intents := m.Step(tea.KeyPressMsg{Code: 'z', Text: "z"})
+	if typed.query != "" {
+		t.Errorf("a keystroke under the prompt grew the filter: %q", typed.query)
+	}
+	if len(intents) != 0 {
+		t.Errorf("it produced %+v", intents)
+	}
+	if typed.confirmClipID != 9 {
+		t.Errorf("the prompt was dismissed by an unrelated key (id=%d)", typed.confirmClipID)
+	}
+
+	entered, intents := m.Step(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if len(intents) != 0 || entered.ClipPasted != 0 {
+		t.Fatalf("Enter under the prompt pasted: %+v / ClipPasted=%d", intents, entered.ClipPasted)
+	}
+	if len(fx.clipIDs) != 0 {
+		t.Fatalf("Enter under the prompt reached the paste spawn: %v", fx.clipIDs)
+	}
+
+	// 🔴 AND `y` UNDER THIS PROMPT DOES NOT ANSWER THE CATALOG'S. The two
+	// populations do not share a confirm: answering here must never land a
+	// deletion through the landing script (a git commit against a label).
+	answered := drive(m, tea.KeyPressMsg{Code: 'y', Text: "y"})
+	if len(fx.deleted) != 0 {
+		t.Fatalf("y over a clip landed a CATALOG deletion: %v", fx.deleted)
+	}
+	if answered.Deleted != "" {
+		t.Errorf("Deleted = %q", answered.Deleted)
+	}
+}
+
+// 🔴 A FAILED DELETE MUST NOT DROP THE ROW, AND IT SAYS WHY. A row that
+// vanished from the list after a refused delete would show the operator a
+// deletion that did not happen. The reason is surfaced the way an unreachable
+// store's is: the notice line plus a toast.
+func TestAFailedDeleteKeepsTheRowAndSaysWhy(t *testing.T) {
+	fx := &fakeLauncher{
+		clips:        clipRows,
+		clipDeleteEr: errors.New("clip store refused (503): the store is read-only"),
+	}
+	m := enterShared(t, fx)
+	m, _ = m.Step(ctrl('x'))
+	m = drive(m, tea.KeyPressMsg{Code: 'y', Text: "y"})
+
+	if len(fx.clipDeletes) != 1 {
+		t.Fatalf("the delete was not attempted: %v", fx.clipDeletes)
+	}
+	ids := clipIDsOf(m.filteredClips)
+	if len(ids) != 3 || ids[0] != 9 {
+		t.Fatalf("the row was dropped on a REFUSED delete: %v", ids)
+	}
+	if fx.fetches != 1 {
+		t.Errorf("fetches = %d — a failed delete changed nothing, so there is nothing to re-read", fx.fetches)
+	}
+	screen := strings.Join(bareLines(m), "\n")
+	if !strings.Contains(screen, "read-only") {
+		t.Errorf("the reason is not on screen: %q", screen)
+	}
+	if !strings.Contains(screen, "delete failed") {
+		t.Errorf("the screen does not say the DELETE failed: %q", screen)
+	}
+	if len(fx.toasts) == 0 {
+		t.Error("a failed delete owes a toast as well as the notice")
+	}
+	if m.quit {
+		t.Error("a failed delete must leave the picker open")
+	}
+	if m.confirmClipID != 0 {
+		t.Errorf("the prompt is still up (id=%d) after the refusal was reported", m.confirmClipID)
+	}
+}
+
+// The shared footer advertises the delete chord, so the affordance is
+// discoverable at all — and the BROWSE footer does not, because the chord has
+// no meaning there.
+func TestTheSharedFooterAdvertisesDelete(t *testing.T) {
+	m := enterShared(t, &fakeLauncher{clips: clipRows})
+	m.Width = 120
+	foot := stripANSI(m.Lines()[len(m.Lines())-1])
+	if !strings.Contains(foot, DeleteKey) || !strings.Contains(foot, "delete") {
+		t.Errorf("the shared footer does not offer %s delete: %q", DeleteKey, foot)
+	}
+	browse := stripANSI(newModel(&fakeLauncher{}).footer())
+	if strings.Contains(browse, DeleteKey) {
+		t.Errorf("the browse footer offers %s, which only means something over a clip: %q", DeleteKey, browse)
+	}
+}
+
+// 🔴 THE TWO CHORDS ARE DISTINCT KEYS AND NEITHER IS A KEY THE BROWSE TABLE
+// ALREADY OWNS. A chord that collided would silently take over an existing
+// binding — the one failure a per-key test cannot see, because each would
+// still pass on its own. This is the enumerated ledger: it fails when the
+// browse set GROWS into these keys or when the two shared chords converge.
+func TestTheSharedChordsCollideWithNothing(t *testing.T) {
+	browseKeys := map[string]bool{
+		"esc": true, "ctrl+c": true, "enter": true, "return": true,
+		"up": true, "ctrl+p": true, "down": true, "ctrl+n": true,
+		"ctrl+e": true, "backspace": true,
+	}
+	if SharedKey == DeleteKey {
+		t.Fatalf("the mode chord and the delete chord are the same key (%q)", SharedKey)
+	}
+	if browseKeys[DeleteKey] {
+		t.Errorf("%s is already a browse-table key", DeleteKey)
+	}
+	// 🔴 AND IT IS NOT A READLINE EDITING CHORD. This list is a text-entry
+	// box; the chords an operator's hands produce there without meaning to are
+	// exactly these, and one of them deleting a clip is the accident this
+	// constant is chosen to prevent.
+	for _, k := range []string{"ctrl+w", "ctrl+u", "ctrl+k", "ctrl+d", "ctrl+h", "ctrl+a"} {
+		if DeleteKey == k {
+			t.Errorf("%s is a readline editing chord — it can arrive from typing", DeleteKey)
+		}
+	}
+	// It must be a MODIFIED chord, not a printable key.
+	if !strings.HasPrefix(DeleteKey, "ctrl+") {
+		t.Errorf("%s is not a ctrl chord — a plain key types itself into the filter", DeleteKey)
+	}
+}
+
+// 🔴 RE-ENTERING THE SHARED MODE RE-FETCHES. The esc arm's comment used to say
+// coming back "does not re-fetch"; the clips do stay in the model, but the
+// ctrl+g arm sets fetching and returns FetchShared unconditionally, so every
+// toggle back is a fresh read. This pins the behaviour the corrected comment
+// describes — and it matters for delete: a row removed from the phone is gone
+// from the desktop's list on the next toggle, not stale.
+func TestComingBackToTheSharedModeReFetches(t *testing.T) {
+	fx := &fakeLauncher{clips: clipRows}
+	m := enterShared(t, fx)
+	m = upd(m, tea.KeyPressMsg{Code: tea.KeyEscape})
+	if m.mode != modeBrowse {
+		t.Fatalf("esc did not return to browse (mode=%v)", m.mode)
+	}
+	if len(m.clips) != 3 {
+		t.Errorf("the clips were cleared on the way out (%d) — the model keeps them", len(m.clips))
+	}
+	m, cmd := updCmd(m, ctrl('g'))
+	if !m.fetching {
+		t.Error("re-entering did not mark a fetch in flight")
+	}
+	for _, msg := range runCmd(cmd) {
+		m = upd(m, msg)
+	}
+	if fx.fetches != 2 {
+		t.Fatalf("fetches = %d after two entries, want 2 — every toggle back re-reads the store", fx.fetches)
+	}
+}
+
+// clipIDsOf is the ids of a clip slice, for comparing a list against a literal.
+func clipIDsOf(cs []shared.Clip) []int64 {
+	var out []int64
+	for _, c := range cs {
+		out = append(out, c.ID)
+	}
+	return out
+}
