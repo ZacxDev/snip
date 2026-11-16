@@ -57,14 +57,20 @@ const SharedKey = "ctrl+g"
 //  1. It is a MODIFIED chord, so it cannot arrive from ordinary typing. Every
 //     plain printable key is taken by the filter (Step's trailing
 //     `Mod == 0` arm), which is the same reason SharedKey is a chord.
-//  2. It is NOT a readline text operation. This list is a text-entry box, and
-//     the keys an operator's hands produce in one without meaning to are the
-//     readline editing chords — ctrl+w (kill word), ctrl+u (kill line),
-//     ctrl+k (kill to end), ctrl+d (delete char / EOF), ctrl+h (backspace),
-//     ctrl+a/ctrl+e (line ends). A bare `d` or `x` is worse still: it is one
-//     keystroke of a filter query. ctrl+x has no editing meaning on an input
-//     line (in readline it is a keymap PREFIX, which does nothing alone), so
-//     no muscle memory sends it here.
+//  2. It is not a readline TEXT-EDITING operation. This list is a text-entry
+//     box, and the chords an operator's hands produce in one without meaning
+//     to are the readline editing keys — ctrl+w (kill word), ctrl+u (kill
+//     line), ctrl+k (kill to end), ctrl+d (delete char / EOF), ctrl+h
+//     (backspace), ctrl+a/ctrl+e (line ends). A bare `d` or `x` is worse
+//     still: it is one keystroke of a filter query. In readline ctrl+x is a
+//     keymap PREFIX, which does nothing alone.
+//     ⚠ THIS PROPERTY IS NARROWER THAN IT USED TO BE WRITTEN. It said "no
+//     muscle memory sends it here", which is false: ctrl+x is the universal
+//     GUI CUT chord, and the thing it is pressed in here is a box you type
+//     into. So the claim is only that it is not a readline EDITING key and
+//     cannot arrive from typing text; a hand reaching for cut WILL send it.
+//     Property 4 is the guard that matters, and it is the only one that is
+//     load-bearing.
 //  3. It is not adjacent in function to any key this mode already uses —
 //     ctrl+p/ctrl+n move, ctrl+c cancels, ctrl+g entered the mode — so a
 //     mistyped navigation chord cannot land on it.
@@ -136,6 +142,24 @@ func clipMatches(body string, tokens []string) bool {
 	return true
 }
 
+// listIsStale is "the rows on screen are not an answer the store has given yet"
+// — a fetch is in flight (re-entry, where the PREVIOUS visit's rows are still
+// rendered, or the post-delete re-list) or a DELETE is in flight.
+//
+// 🔴 IT GATES THE TWO ACTIONABLE KEYS, WHICH IS THE ALTERNATIVE TO CLEARING THE
+// ROWS ON MODE ENTRY, and it is the one chosen deliberately: clearing them
+// would also blank the list during the post-delete re-list, which the design
+// explicitly keeps on screen (a refused delete must leave the row visible,
+// picker.go's clipDeleted), and it would flash an empty list on every ctrl+g.
+// Gating instead keeps the rows readable while making the two keys that act on
+// a row — `enter` (pastes it) and DeleteKey (deletes it from every device) —
+// inert until the list is the store's current answer. Moving the cursor,
+// typing a filter and esc all stay live: none of them acts on a row.
+//
+// The screen already says why: sharedBodyLine renders "fetching the shared
+// clipboard…" for exactly this window.
+func (m Model) listIsStale() bool { return m.fetching || m.deletingClipID != 0 }
+
 // stepShared is the shared mode's whole key table. 🔴 IT IS DISJOINT: every
 // key it does not name is swallowed, and there is no arm that falls through to
 // the browse table.
@@ -150,11 +174,26 @@ func (m Model) stepShared(msg tea.KeyPressMsg) (Model, []Intent) {
 	if m.confirmClipID != 0 {
 		switch msg.String() {
 		case "y", "Y":
-			return m, []Intent{DeleteClip{ID: m.confirmClipID}}
+			// 🔴 THE ANSWERED PROMPT COMES DOWN HERE, and the id moves to the
+			// in-flight field. Both halves matter: the question has been
+			// answered, so leaving it on screen would invite a second answer;
+			// and while the DELETE is in flight `n` must no longer reach the
+			// arm below, which would have printed "the clip is still in the
+			// store" over a deletion that then lands (round-1 finding 9).
+			// clipDeleted clears deletingClipID, success or failure.
+			id := m.confirmClipID
+			m.confirmClipID, m.deletingClipID = 0, id
+			m.notice = fmt.Sprintf("deleting clip %d from the shared store…", id)
+			return m, []Intent{DeleteClip{ID: id}}
 		case "n", "N", "esc":
 			// Backs out of the DELETION, not out of the mode: the operator
 			// asked about one row and is answering no. A second esc returns to
 			// browse as usual.
+			//
+			// 🔴 THE REASSURANCE IS TRUE BECAUSE OF THE `y` ARM ABOVE, not
+			// because of anything here: nothing has been called while this
+			// prompt is up, and once it IS called the prompt is down and this
+			// arm is unreachable for that delete.
 			m.confirmClipID = 0
 			m.notice = "deletion cancelled — the clip is still in the store"
 			return m, nil
@@ -168,11 +207,19 @@ func (m Model) stepShared(msg tea.KeyPressMsg) (Model, []Intent) {
 	case "esc":
 		// BACK TO BROWSE, not out of the picker. The operator asked for one
 		// thing (the shared list) and esc undoes that one thing; a second esc
-		// closes the TUI as usual. The fetched clips are LEFT in the model —
-		// nothing clears them — but coming back through ctrl+g re-fetches
-		// unconditionally, so what is on screen is always a fresh read rather
-		// than the rows from the previous visit. The kept clips are what the
-		// catalog-list round-trip test observes, not a cache the mode reads.
+		// closes the TUI as usual.
+		//
+		// 🔴 THE FETCHED CLIPS ARE LEFT IN THE MODEL, AND ON RE-ENTRY THEY ARE
+		// WHAT IS ON SCREEN UNTIL THE RE-FETCH LANDS. This comment used to
+		// claim "what is on screen is always a fresh read rather than the rows
+		// from the previous visit" — measured FALSE (round-1 finding 7): ctrl+g
+		// refilters the KEPT clips and only then fires the fetch, so the
+		// previous visit's rows render immediately, with a cursor on one of
+		// them. They are not actionable while that fetch is in flight —
+		// `enter` and DeleteKey are gated on !m.fetching below — which is the
+		// property that makes showing them safe rather than the false claim
+		// that they are not shown. The screen says "fetching the shared
+		// clipboard…" for exactly that window.
 		m.mode = modeBrowse
 		m.query = ""
 		m.cursor = 0
@@ -185,6 +232,9 @@ func (m Model) stepShared(msg tea.KeyPressMsg) (Model, []Intent) {
 	case "enter", "return":
 		if len(m.filteredClips) == 0 {
 			return m, nil // nothing to choose; Enter is inert on an empty list
+		}
+		if m.listIsStale() {
+			return m, nil
 		}
 		c := m.filteredClips[m.cursor]
 		// 🔴 quit is NOT set here — only the spawned OUTCOME closes the TUI,
@@ -213,21 +263,16 @@ func (m Model) stepShared(msg tea.KeyPressMsg) (Model, []Intent) {
 		if len(m.filteredClips) == 0 {
 			return m, nil
 		}
-		c := m.filteredClips[m.cursor]
-		m.confirmClipID = c.ID
-		// The prompt NAMES THE ROW — its id and a one-line preview of its body
-		// — so the answer cannot be about a different clip than the one under
-		// the cursor, the property the catalog prompt's label spelling has.
-		//
-		// 🔴 THE `[y/N]` LEADS, unlike the catalog prompt's trailing one. The
-		// notice line is TRUNCATED to the terminal width (Lines renders it
-		// through truncate), and with the ask at the end an 80-column terminal
-		// cut it off — measured, as the first run of this feature's own test.
-		// A destructive prompt whose answer shape is the part that disappears
-		// is worse than one with a short preview, so the preview is what gives
-		// way.
-		m.notice = fmt.Sprintf("[y/N] delete clip %d from the shared store — %q · no undo",
-			c.ID, truncate(oneLine(c.Body), 32))
+		if m.listIsStale() {
+			return m, nil
+		}
+		// 🔴 ARMING THE FIELD IS THE WHOLE OF IT — THERE IS NO SECOND HALF TO
+		// KEEP IN SYNC. The prompt's TEXT is rendered from confirmClipID
+		// (picker.go's confirmPrompt), so no handler can take the question off
+		// the screen while leaving the answer live; this arm used to park a
+		// copy of the prompt in m.notice, which three handlers cleared without
+		// looking at the confirm fields.
+		m.confirmClipID = m.filteredClips[m.cursor].ID
 		return m, nil
 	case "backspace":
 		if r := []rune(m.query); len(r) > 0 {

@@ -2,6 +2,11 @@ package picker
 
 import (
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -725,22 +730,120 @@ func TestTheSharedFooterAdvertisesDelete(t *testing.T) {
 	}
 }
 
+// keyTableOf reads a key table OUT OF THE SOURCE: every `case` label of every
+// `switch msg.String()` inside the named function, with the two key constants
+// resolved to their values.
+//
+// 🔴 IT PARSES picker.go RATHER THAN RESTATING IT, AND THAT IS THE WHOLE POINT.
+// This guard used to compare against a hand-written SECOND COPY of the browse
+// table, which is a copy of a list, not a read of the code: adding
+// `case "ctrl+x":` to the real browse switch left the entire suite GREEN
+// (round-1 finding 3 — mutation-proven). An empty case body makes the mutation
+// behaviourally invisible, so no amount of key-pressing can see it; only
+// reading the table can. The source IS the ledger now, and it fails when the
+// browse set grows into the shared chords.
+func keyTableOf(t *testing.T, file, funcName string) map[string]bool {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v — this guard reads the real key table and cannot "+
+			"fall back on a copy of it", file, err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == funcName {
+			fn = fd
+		}
+	}
+	if fn == nil {
+		t.Fatalf("%s holds no func %s — the key table moved and this guard is "+
+			"reading nothing", file, funcName)
+	}
+	keys := map[string]bool{}
+	ast.Inspect(fn, func(n ast.Node) bool {
+		sw, ok := n.(*ast.SwitchStmt)
+		if !ok {
+			return true
+		}
+		// Only the switches on the KEY STRING; a switch on anything else is
+		// not a key table.
+		call, ok := sw.Tag.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "String" {
+			return true
+		}
+		for _, stmt := range sw.Body.List {
+			cc, ok := stmt.(*ast.CaseClause)
+			if !ok {
+				continue
+			}
+			for _, expr := range cc.List {
+				switch e := expr.(type) {
+				case *ast.BasicLit:
+					if e.Kind == token.STRING {
+						if v, err := strconv.Unquote(e.Value); err == nil {
+							keys[v] = true
+						}
+					}
+				case *ast.Ident:
+					// The key CONSTANTS, resolved to the values Step compares.
+					switch e.Name {
+					case "SharedKey":
+						keys[SharedKey] = true
+					case "DeleteKey":
+						keys[DeleteKey] = true
+					default:
+						t.Fatalf("%s: case %s is an identifier this guard cannot "+
+							"resolve — resolve it here rather than letting the "+
+							"ledger silently miss a key", funcName, e.Name)
+					}
+				}
+			}
+		}
+		return true
+	})
+	return keys
+}
+
 // 🔴 THE TWO CHORDS ARE DISTINCT KEYS AND NEITHER IS A KEY THE BROWSE TABLE
 // ALREADY OWNS. A chord that collided would silently take over an existing
 // binding — the one failure a per-key test cannot see, because each would
-// still pass on its own. This is the enumerated ledger: it fails when the
-// browse set GROWS into these keys or when the two shared chords converge.
+// still pass on its own. This is the ledger, READ OUT OF THE SOURCE: it fails
+// when the browse set GROWS into these keys or when the two shared chords
+// converge.
 func TestTheSharedChordsCollideWithNothing(t *testing.T) {
-	browseKeys := map[string]bool{
-		"esc": true, "ctrl+c": true, "enter": true, "return": true,
-		"up": true, "ctrl+p": true, "down": true, "ctrl+n": true,
-		"ctrl+e": true, "backspace": true,
+	browseKeys := keyTableOf(t, "picker.go", "Step")
+
+	// 🔴 VALIDATE THE INSTRUMENT BEFORE READING ITS VERDICT. A parse that found
+	// the wrong switch, or no switch, would report an empty set — and an empty
+	// set satisfies every assertion below while measuring nothing. These keys
+	// are in the browse table today; if they are not in the parsed set, the
+	// read is broken and the verdict is worthless.
+	for _, k := range []string{"esc", "ctrl+c", "enter", "up", "down", "backspace", "ctrl+e", SharedKey} {
+		if !browseKeys[k] {
+			t.Fatalf("the parsed browse table is missing %q (%d keys: %v) — this "+
+				"guard is reading the wrong code and proves nothing", k, len(browseKeys), browseKeys)
+		}
 	}
+	// And the shared table is read the same way, so the delete chord is known
+	// to live SOMEWHERE — a DeleteKey that no table names would pass the
+	// collision check vacuously.
+	sharedKeys := keyTableOf(t, "shared.go", "stepShared")
+	if !sharedKeys[DeleteKey] {
+		t.Fatalf("the shared table does not name %s (%v) — the chord is dead and "+
+			"this guard is vacuous", DeleteKey, sharedKeys)
+	}
+
 	if SharedKey == DeleteKey {
 		t.Fatalf("the mode chord and the delete chord are the same key (%q)", SharedKey)
 	}
 	if browseKeys[DeleteKey] {
-		t.Errorf("%s is already a browse-table key", DeleteKey)
+		t.Errorf("%s is a key the REAL browse table now names (picker.go's Step) — "+
+			"the destructive shared chord collides with a catalog binding", DeleteKey)
 	}
 	// 🔴 AND IT IS NOT A READLINE EDITING CHORD. This list is a text-entry
 	// box; the chords an operator's hands produce there without meaning to are
@@ -777,11 +880,515 @@ func TestComingBackToTheSharedModeReFetches(t *testing.T) {
 	if !m.fetching {
 		t.Error("re-entering did not mark a fetch in flight")
 	}
+	// 🔴 AND THE PREVIOUS VISIT'S ROWS ARE WHAT IS ON SCREEN UNTIL IT LANDS —
+	// the thing the esc arm's comment used to deny. This test pinned the kept
+	// clips without noticing they were RENDERED and ACTIONABLE, which is the
+	// sentence that hid the blocker (round-1 finding 7). What matters is not
+	// that they are absent (they are not) but that they cannot be acted on:
+	// the frame shows them, says it is still fetching, and the two keys that
+	// act on a row are inert.
+	m.Width = 120
+	frame := strings.Join(bareLines(m), "\n")
+	if !strings.Contains(frame, "github.com password hunter2") {
+		t.Errorf("the previous visit's rows are NOT on screen — if that ever "+
+			"becomes true, the esc arm's comment and listIsStale both need "+
+			"rewriting, not this assertion deleting:\n%s", frame)
+	}
+	if !strings.Contains(frame, "fetching") {
+		t.Errorf("the frame does not say the list is being re-read:\n%s", frame)
+	}
+	if _, intents := m.Step(tea.KeyPressMsg{Code: tea.KeyEnter}); len(intents) != 0 {
+		t.Errorf("enter acted on the previous visit's rows: %+v", intents)
+	}
+	if armed, intents := m.Step(ctrl('x')); len(intents) != 0 || armed.confirmClipID != 0 {
+		t.Errorf("ctrl+x armed a delete against the previous visit's rows: %+v / id=%d",
+			intents, armed.confirmClipID)
+	}
 	for _, msg := range runCmd(cmd) {
 		m = upd(m, msg)
 	}
 	if fx.fetches != 2 {
 		t.Fatalf("fetches = %d after two entries, want 2 — every toggle back re-reads the store", fx.fetches)
+	}
+}
+
+// --- the blocker: an armed prompt that was not on the screen -------------------
+
+// wantClipPrompt is the prompt line for clip 9 of clipRows, as a LITERAL. It is
+// written out here rather than derived from confirmPrompt: a guard that asks the
+// implementation what to expect asserts only that the code equals itself.
+//
+// 🔴 IT PINS THE WHOLE NORMALISED STRING, NOT A WORD. Greping the frame for
+// "delete clip" is walkable by rewording the prompt — the hazard would still be
+// there in a different spelling, and the guard would still be green. The price
+// is that a cosmetic reword fails this test; that is the price of a
+// machine-readable claim about what is on the screen.
+const wantClipPrompt = `[y/N] delete clip 9 from the shared store — "github.com password hunter2" · no undo`
+
+// wantClipPromptGone is the same prompt when the armed clip is no longer in the
+// list — the store was re-read underneath the prompt and answered without it.
+// The ask and the id stay; only the preview gives way, and its absence is named
+// rather than rendered as an empty pair of quotes.
+const wantClipPromptGone = `[y/N] delete clip 9 from the shared store — (that row is no longer listed) · no undo`
+
+// armedPrompt is the settled shared mode with the delete prompt up on clip 9,
+// on a terminal wide enough that the prompt is not truncated.
+func armedPrompt(t *testing.T, fx *fakeLauncher) Model {
+	t.Helper()
+	m := enterShared(t, fx)
+	m.Width = 200
+	m, _ = m.Step(ctrl('x'))
+	if m.confirmClipID != 9 {
+		t.Fatalf("fixture: confirmClipID = %d, want 9", m.confirmClipID)
+	}
+	if !strings.Contains(strings.Join(bareLines(m), "\n"), wantClipPrompt) {
+		t.Fatalf("fixture: the prompt is not on screen to begin with:\n%s",
+			strings.Join(bareLines(m), "\n"))
+	}
+	return m
+}
+
+// 🔴 THE ROUND-1 BLOCKER, AS A RELATIONSHIP RATHER THAN A WORD:
+//
+//	m.confirmClipID != 0  ⇔  the rendered frame carries THAT clip's prompt
+//
+// The armed half (confirmClipID, which accepts `y`) and the visible half (a
+// copy of the prompt text parked in m.notice) used to be two facts in two
+// fields with two lifetimes, and three handlers cleared the second without
+// looking at the first. A fetch landing between the ctrl+x and the keypress
+// wiped the question off the screen while leaving the answer live, and `y` —
+// the first character of an ordinary filter query, under a footer reading "type
+// to filter" — deleted a clip from every device with no undo.
+//
+// This asserts the BICONDITIONAL over every state mutation that used to break
+// it, so it fails whether the prompt goes missing while armed OR is rendered
+// while disarmed. It cannot be satisfied by rewording anything, and it cannot
+// be satisfied by re-adding `if m.confirmClipID == 0` at one of the three
+// notice sites, because it enumerates all three plus a direct write.
+func TestAnArmedClipPromptIsOnTheScreenExactlyWhenItIsArmed(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(Model) Model
+		// want is the EXACT line the frame must carry, or "" when the mutation
+		// legitimately disarms the prompt (then the frame must carry neither
+		// spelling). Literal, not derived: a guard that asks confirmPrompt what
+		// to expect asserts only that the code equals itself.
+		want string
+	}{
+		{"a fetch lands with rows (the blocker's own route)", func(m Model) Model {
+			return upd(m, sharedFetched{Clips: clipRows})
+		}, wantClipPrompt},
+		{"a fetch lands empty — the row is gone from under the prompt", func(m Model) Model {
+			return upd(m, sharedFetched{Clips: nil})
+		}, wantClipPromptGone},
+		{"a fetch fails", func(m Model) Model {
+			return upd(m, sharedFetched{Err: errors.New("i/o timeout")})
+		}, wantClipPrompt},
+		{"a delete is refused", func(m Model) Model {
+			return upd(m, clipDeleted{Err: errors.New("503 read-only")})
+		}, ""},
+		{"a delete lands", func(m Model) Model {
+			return upd(m, clipDeleted{})
+		}, ""},
+		{"a handler writes the notice directly", func(m Model) Model {
+			m.notice = "something else entirely"
+			return m
+		}, wantClipPrompt},
+		{"the window is resized", func(m Model) Model {
+			return upd(m, tea.WindowSizeMsg{Width: 200, Height: 24})
+		}, wantClipPrompt},
+		{"nothing happens at all", func(m Model) Model { return m }, wantClipPrompt},
+	}
+	armedSeen, disarmedSeen := 0, 0
+	for _, c := range cases {
+		m := c.mutate(armedPrompt(t, &fakeLauncher{clips: clipRows}))
+		screen := strings.Join(bareLines(m), "\n")
+		onScreen := strings.Contains(screen, wantClipPrompt) ||
+			strings.Contains(screen, wantClipPromptGone)
+		armed := m.confirmClipID != 0
+		if armed {
+			armedSeen++
+		} else {
+			disarmedSeen++
+		}
+		if armed != onScreen {
+			t.Errorf("%s: confirmClipID=%d (armed=%v) but the prompt on screen = %v.\n"+
+				"An armed prompt that is not rendered is the round-1 blocker: `y` is "+
+				"live with nothing asking for it.\nframe:\n%s",
+				c.name, m.confirmClipID, armed, onScreen, screen)
+		}
+		if c.want != "" && !strings.Contains(screen, c.want) {
+			t.Errorf("%s: the frame does not carry the expected prompt line.\nwant: %s\nframe:\n%s",
+				c.name, c.want, screen)
+		}
+		if c.want == "" && onScreen {
+			t.Errorf("%s: a disarmed prompt is still on the screen:\n%s", c.name, screen)
+		}
+		// 🔴 AND ARMED MEANS ARMED: the biconditional must not be satisfied by
+		// disarming everything, so where it IS armed, `y` still answers.
+		if armed {
+			_, intents := m.Step(tea.KeyPressMsg{Code: 'y', Text: "y"})
+			if len(intents) != 1 {
+				t.Errorf("%s: the prompt is rendered and armed, but y produced %+v",
+					c.name, intents)
+			}
+		}
+	}
+	// The loop is only meaningful if it exercised BOTH directions.
+	if armedSeen == 0 || disarmedSeen == 0 {
+		t.Fatalf("the cases covered armed=%d disarmed=%d — the biconditional was "+
+			"only ever tested in one direction, which it satisfies trivially",
+			armedSeen, disarmedSeen)
+	}
+}
+
+// 🔴 THE AUDITOR'S EXACT ROUTE, DRIVEN THROUGH Update WITH REAL KEY MESSAGES:
+// ctrl+g → rows land → esc → ctrl+g (the PREVIOUS visit's rows are on screen
+// and a re-fetch is in flight) → ↓ → ctrl+x → the re-fetch lands → `y`.
+//
+// Before the fix: ctrl+x raised the prompt against the stale list, the landing
+// fetch wiped the prompt text, and `y` emitted DeleteClip for the clip the
+// cursor had been on — no prompt in sight, no undo. After: ctrl+x is inert
+// while the list is stale (listIsStale), so nothing is armed, and `y` is an
+// ordinary filter character.
+func TestTheAuditorsRouteCannotDeleteAClipByTypingY(t *testing.T) {
+	fx := &fakeLauncher{clips: clipRows}
+	m := enterShared(t, fx) // ctrl+g, fetch run
+	m.Width = 200
+	m = upd(m, tea.KeyPressMsg{Code: tea.KeyEscape})
+
+	// Re-enter and hold the fetch: the cmd is NOT run, so the previous visit's
+	// rows are what is on screen while the re-read is in flight.
+	m, pending := updCmd(m, ctrl('g'))
+	if !m.fetching || len(m.filteredClips) != 3 {
+		t.Fatalf("fixture: fetching=%v rows=%d — the route needs stale rows on "+
+			"screen with a fetch in flight", m.fetching, len(m.filteredClips))
+	}
+	m = upd(m, tea.KeyPressMsg{Code: tea.KeyDown})
+	m, intents := m.Step(ctrl('x'))
+	if len(intents) != 0 {
+		t.Fatalf("ctrl+x on a stale list produced %+v", intents)
+	}
+	if m.confirmClipID != 0 {
+		t.Fatalf("ctrl+x armed a delete against a list that is not the store's "+
+			"current answer (id=%d)", m.confirmClipID)
+	}
+
+	// The re-fetch lands.
+	for _, msg := range runCmd(pending) {
+		m = upd(m, msg)
+	}
+
+	// …and the operator types `y` as the first character of a filter query.
+	m, intents = m.Step(tea.KeyPressMsg{Code: 'y', Text: "y"})
+	for _, it := range intents {
+		if dc, ok := it.(DeleteClip); ok {
+			t.Fatalf("typing y produced DeleteClip{%d} — the blocker is back", dc.ID)
+		}
+	}
+	if len(fx.clipDeletes) != 0 {
+		t.Fatalf("the store was called: %v", fx.clipDeletes)
+	}
+	if m.query != "y" {
+		t.Errorf("query = %q, want \"y\" — with no prompt up, y is a filter character", m.query)
+	}
+
+	// THE OTHER HALF: a prompt armed against a SETTLED list survives a fetch
+	// landing late (two fetches in flight across an esc is how that happens),
+	// and the answer is still being asked for on screen.
+	m2 := armedPrompt(t, &fakeLauncher{clips: clipRows})
+	m2 = upd(m2, sharedFetched{Clips: clipRows})
+	screen := strings.Join(bareLines(m2), "\n")
+	if !strings.Contains(screen, wantClipPrompt) {
+		t.Fatalf("a late fetch wiped the armed prompt off the screen:\n%s", screen)
+	}
+	m2, intents = m2.Step(tea.KeyPressMsg{Code: 'y', Text: "y"})
+	if len(intents) != 1 {
+		t.Fatalf("y under the surviving prompt produced %+v, want one DeleteClip", intents)
+	}
+	if _, ok := intents[0].(DeleteClip); !ok {
+		t.Fatalf("intent = %T, want DeleteClip", intents[0])
+	}
+	if m2.query != "" {
+		t.Errorf("query = %q — y answered the prompt AND typed itself in", m2.query)
+	}
+}
+
+// 🔴 THE STALE LIST IS NOT ACTIONABLE. The rows from the previous visit are on
+// screen while the re-fetch is in flight (the esc arm's comment says so, and
+// says this is why that is safe); the two keys that ACT on a row must be inert
+// until the list is the store's current answer. Navigation, typing and esc stay
+// live — none of them acts on a row.
+func TestTheStaleListIsNotActionableWhileAFetchIsInFlight(t *testing.T) {
+	fx := &fakeLauncher{clips: clipRows}
+	m := enterShared(t, fx)
+	m = upd(m, tea.KeyPressMsg{Code: tea.KeyEscape})
+	m, pending := updCmd(m, ctrl('g'))
+	if !m.fetching {
+		t.Fatal("fixture: the re-entry fetch is not in flight")
+	}
+
+	m, intents := m.Step(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if len(intents) != 0 || m.ClipPasted != 0 {
+		t.Fatalf("enter pasted from a stale list: %+v / ClipPasted=%d", intents, m.ClipPasted)
+	}
+	m, intents = m.Step(ctrl('x'))
+	if len(intents) != 0 || m.confirmClipID != 0 {
+		t.Fatalf("ctrl+x armed against a stale list: %+v / id=%d", intents, m.confirmClipID)
+	}
+	// Navigation and typing are NOT gated: the cursor and the filter act on no row.
+	moved := upd(m, tea.KeyPressMsg{Code: tea.KeyDown})
+	if moved.cursor != 1 {
+		t.Errorf("cursor = %d — moving the cursor is not an action on a row and "+
+			"must stay live while fetching", moved.cursor)
+	}
+	if typed := typeStr(m, "pass"); typed.query != "pass" {
+		t.Errorf("query = %q — typing must stay live while fetching", typed.query)
+	}
+
+	// POSITIVE CONTROL: once the answer lands, BOTH keys work — so the silence
+	// above is about the in-flight fetch and not about two dead keys.
+	for _, msg := range runCmd(pending) {
+		m = upd(m, msg)
+	}
+	settled, intents := m.Step(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if len(intents) != 1 || settled.ClipPasted == 0 {
+		t.Fatalf("enter is dead on a SETTLED list (%+v) — this control proves nothing", intents)
+	}
+	if _, intents := m.Step(ctrl('x')); len(intents) != 0 {
+		t.Fatalf("ctrl+x produced %+v on a settled list, want the prompt only", intents)
+	}
+	if asked, _ := m.Step(ctrl('x')); asked.confirmClipID == 0 {
+		t.Fatal("ctrl+x raises no prompt on a SETTLED list — this control proves nothing")
+	}
+
+	// And a DELETE in flight is stale too: the row being removed must not be
+	// pasteable or deletable again while the call is on the wire.
+	inflight, _ := m.Step(ctrl('x'))
+	inflight, _ = inflight.Step(tea.KeyPressMsg{Code: 'y', Text: "y"})
+	if inflight.deletingClipID != 9 {
+		t.Fatalf("deletingClipID = %d after y, want 9", inflight.deletingClipID)
+	}
+	if again, intents := inflight.Step(ctrl('x')); len(intents) != 0 || again.confirmClipID != 0 {
+		t.Fatalf("ctrl+x armed a second delete while one was in flight: %+v / id=%d",
+			intents, again.confirmClipID)
+	}
+}
+
+// 🔴 THE DECLINE ARM CANNOT PRINT A FALSE REASSURANCE. Pressing `n` after `y`
+// used to say "deletion cancelled — the clip is still in the store" while the
+// DELETE was on the wire; it then landed, and the operator had been told in
+// words that his data was safe (round-1 finding 9). `y` takes the prompt DOWN
+// and moves the id to the in-flight field, so that arm is unreachable for a
+// delete that has already been called.
+func TestDecliningAfterTheAnswerCannotClaimTheClipIsStillThere(t *testing.T) {
+	fx := &fakeLauncher{clips: clipRows}
+	m := armedPrompt(t, fx)
+	m, delCmd := updCmd(m, tea.KeyPressMsg{Code: 'y', Text: "y"})
+	if m.confirmClipID != 0 || m.deletingClipID != 9 {
+		t.Fatalf("after y: confirmClipID=%d deletingClipID=%d — the answered prompt "+
+			"must come down and the in-flight id must be recorded",
+			m.confirmClipID, m.deletingClipID)
+	}
+	// `n`, while the call is on the wire.
+	m2, _ := m.Step(tea.KeyPressMsg{Code: 'n', Text: "n"})
+	screen := strings.Join(bareLines(m2), "\n")
+	if strings.Contains(screen, "still in the store") || strings.Contains(screen, "cancelled") {
+		t.Errorf("the screen claims the deletion was cancelled while the DELETE is "+
+			"in flight:\n%s", screen)
+	}
+	// The delete does land, and the frame never said otherwise.
+	for _, msg := range runCmd(delCmd) {
+		m = upd(m, msg)
+	}
+	if len(fx.clipDeletes) != 1 || fx.clipDeletes[0] != 9 {
+		t.Fatalf("DeleteClip calls = %v, want [9]", fx.clipDeletes)
+	}
+	if m.deletingClipID != 0 {
+		t.Errorf("deletingClipID = %d after the answer landed, want 0", m.deletingClipID)
+	}
+	// POSITIVE CONTROL: `n` BEFORE any answer does cancel, and says so — so the
+	// assertion above is about the in-flight state, not about a dead arm.
+	declined, _ := armedPrompt(t, &fakeLauncher{clips: clipRows}).
+		Step(tea.KeyPressMsg{Code: 'n', Text: "n"})
+	if !strings.Contains(strings.Join(bareLines(declined), "\n"), "still in the store") {
+		t.Fatal("n on an UNANSWERED prompt does not say the clip is safe — this " +
+			"control proves nothing")
+	}
+}
+
+// 🔴 A CLIP PASTE EMITS NO CANCEL ROW. finish() branches on m.Selected, which
+// the clip path never sets (a clip has no label to put there), so every
+// successful clip paste used to fall through to the cancel arm and emit
+// outcome=cancel ON TOP of the helper's select row: one paste, two rows, and a
+// clip store in 100% use reading as 50% cancels (round-1 finding 2).
+func TestAClipPasteEmitsNoPickerRow(t *testing.T) {
+	// The auditor's own probe, as a literal.
+	rows := capturePickerRows(t)
+	if code := finish(Model{mode: modeShared, ClipPasted: 7, quit: true}); code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+	if len(rows.rows) != 0 {
+		t.Fatalf("a clip paste emitted %+v — the helper owns the select row", rows.rows)
+	}
+
+	// And through the real route: enter → the spawn succeeds → the TUI quits.
+	rows2 := capturePickerRows(t)
+	fx := &fakeLauncher{clips: clipRows}
+	m := typeStr(enterShared(t, fx), "pass")
+	m, cmd := updCmd(m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	for _, msg := range runCmd(cmd) {
+		m = upd(m, msg)
+	}
+	if !m.quit || m.ClipPasted != 9 {
+		t.Fatalf("fixture: quit=%v ClipPasted=%d", m.quit, m.ClipPasted)
+	}
+	if code := finish(m); code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+	if len(rows2.rows) != 0 {
+		t.Fatalf("the clip-paste route emitted %+v, want nothing", rows2.rows)
+	}
+
+	// POSITIVE CONTROL: the SAME finish does emit a cancel row when the open
+	// resolved to nothing, so the two zeros above are not a dead emitter.
+	rows3 := capturePickerRows(t)
+	c, _ := enterShared(t, fx).Step(ctrl('c'))
+	_ = finish(c)
+	if len(rows3.rows) != 1 || rows3.rows[0].Outcome != "cancel" {
+		t.Fatalf("a cancel emitted %+v — this control proves nothing", rows3.rows)
+	}
+}
+
+// 🔴 A LATE sharedFetched MUST NOT MOVE THE BROWSE VIEW. The fetch is in flight
+// across an `esc`, so its answer can arrive while the CATALOG list is on
+// screen: it used to set m.cursor = 0 unconditionally, so the row under a
+// pending Enter changed out from under the operator and he pasted row 0
+// (round-1 finding 5) — and its failure arm wrote its notice over the catalog
+// list. Same root shape as the blocker: a handler mutating state it does not
+// own.
+func TestALateFetchDoesNotMoveTheBrowseView(t *testing.T) {
+	fx := &fakeLauncher{clips: clipRows}
+	m := enterShared(t, fx)
+	m = upd(m, tea.KeyPressMsg{Code: tea.KeyEscape})
+	for i := 0; i < 3; i++ {
+		m = upd(m, tea.KeyPressMsg{Code: tea.KeyDown})
+	}
+	if m.mode != modeBrowse || m.cursor != 3 {
+		t.Fatalf("fixture: mode=%v cursor=%d", m.mode, m.cursor)
+	}
+	want := m.filtered[m.cursor].Label
+
+	// A late SUCCESS: the rows are taken, the cursor is not moved.
+	landed := upd(m, sharedFetched{Clips: clipRows})
+	if landed.cursor != 3 {
+		t.Errorf("a late fetch moved the browse cursor to %d — the row under a "+
+			"pending Enter changed", landed.cursor)
+	}
+	if got := landed.filtered[landed.cursor].Label; got != want {
+		t.Errorf("the row under the cursor is now %q, want %q", got, want)
+	}
+	if len(landed.clips) != 3 {
+		t.Errorf("the clips were dropped (%d) — they are this mode's data and are "+
+			"kept for the next ctrl+g", len(landed.clips))
+	}
+	sel, _ := landed.Step(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if sel.Selected != want {
+		t.Errorf("Enter pasted %q, want %q", sel.Selected, want)
+	}
+
+	// A late FAILURE: the reason does not land on the catalog list. The toast
+	// still fires — it is the channel that survives the mode.
+	failed := upd(m, sharedFetched{Err: errors.New("i/o timeout")})
+	screen := strings.Join(bareLines(failed), "\n")
+	if strings.Contains(screen, "i/o timeout") {
+		t.Errorf("a late fetch failure wrote its reason over the catalog list:\n%s", screen)
+	}
+	if len(fx.toasts) == 0 {
+		t.Error("the failure owes a toast — that is where it goes instead")
+	}
+	if failed.cursor != 3 {
+		t.Errorf("the failure arm moved the browse cursor to %d", failed.cursor)
+	}
+
+	// POSITIVE CONTROL: the same message IN shared mode does render the reason
+	// and does reset the cursor, so the silences above are about the mode.
+	shared := upd(enterShared(t, fx), sharedFetched{Err: errors.New("i/o timeout")})
+	if !strings.Contains(strings.Join(bareLines(shared), "\n"), "i/o timeout") {
+		t.Fatal("the reason is not rendered in shared mode either — this control " +
+			"proves nothing")
+	}
+}
+
+// 🔴 THE FRAME FITS THE TERMINAL HEIGHT IN EVERY SHARED STATE, THE RE-LIST
+// INCLUDED. chromeLines counted the header, footer and notice but not
+// sharedBodyLine, which Lines appends IN ADDITION to the rows while fetching —
+// the re-entry and post-delete states. Measured at Height=10: 10 lines settled,
+// 11 re-listing (round-1 finding 8).
+func TestTheSharedFrameFitsTheHeight(t *testing.T) {
+	many := make([]shared.Clip, 12)
+	for i := range many {
+		many[i] = shared.Clip{
+			ID:        int64(i + 1),
+			Body:      fmt.Sprintf("clip body %d", i+1),
+			Device:    "phone",
+			CreatedAt: 1_700_000_000_000,
+		}
+	}
+	fx := &fakeLauncher{clips: many, clipsAfterDelete: many[1:]}
+
+	check := func(name string, m Model) {
+		if n := len(m.Lines()); n > m.Height {
+			t.Errorf("%s: the frame is %d lines on a %d-line terminal — it overflows "+
+				"by %d:\n%s", name, n, m.Height, n-m.Height,
+				strings.Join(bareLines(m), "\n"))
+		}
+	}
+	settled := enterShared(t, fx)
+	settled.Height, settled.Width = 10, 120
+	check("settled", settled)
+
+	// Re-entry: the previous rows are on screen AND the fetching line is up.
+	back := upd(settled, tea.KeyPressMsg{Code: tea.KeyEscape})
+	reentry, _ := updCmd(back, ctrl('g'))
+	reentry.Height, reentry.Width = 10, 120
+	if !reentry.fetching || len(reentry.filteredClips) == 0 {
+		t.Fatalf("fixture: fetching=%v rows=%d", reentry.fetching, len(reentry.filteredClips))
+	}
+	check("re-entering with stale rows", reentry)
+
+	// The post-delete re-list: same shape, reached the other way.
+	armed, _ := settled.Step(ctrl('x'))
+	relist, _ := updCmd(armed, tea.KeyPressMsg{Code: 'y', Text: "y"})
+	relist = upd(relist, clipDeleted{})
+	relist.Height, relist.Width = 10, 120
+	if !relist.fetching {
+		t.Fatalf("fixture: the post-delete re-list is not in flight")
+	}
+	check("post-delete re-list", relist)
+
+	// With the notice line up as well — every chrome line at once.
+	noticed := relist
+	noticed.notice = "a notice line is up too"
+	check("re-list with a notice", noticed)
+
+	// POSITIVE CONTROL ON THE MEASUREMENT: at an absurd height the chrome alone
+	// cannot fit and the frame DOES exceed it. So `len(Lines()) > Height` is a
+	// comparison that can come out true, and the three passes above are real
+	// zeros rather than an assertion that never fires.
+	tiny := settled
+	tiny.Height = 2 // a terminal too short for the header and footer alone
+	if n := len(tiny.Lines()); n <= tiny.Height {
+		t.Fatalf("a 3-line terminal rendered %d lines without overflowing — the "+
+			"overflow check above cannot see one and proves nothing", n)
+	}
+	// And the FULL frame really is at the budget, not comfortably under it: a
+	// settled 10-line terminal shows 10 lines, so one uncounted chrome line is
+	// an overflow rather than slack absorbing it.
+	if n := len(settled.Lines()); n != settled.Height {
+		t.Errorf("the settled frame is %d lines on a %d-line terminal — this "+
+			"fixture has slack, so it could absorb an uncounted chrome line",
+			n, settled.Height)
 	}
 }
 

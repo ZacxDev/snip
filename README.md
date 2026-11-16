@@ -28,8 +28,10 @@ catalog.
   from the X clipboard (no shell vars, no date vars, no forms).
 - **`ctrl+g` shared clipboard** — an opt-in second keypress that lists a
   cross-device clip store as a *disjoint mode* with its own list, filter and
-  keys, and pastes a clip body into the origin window. Unconfigured by
-  default; see [The shared clipboard](#the-shared-clipboard-ctrlg).
+  keys, and pastes a clip body into the origin window. Inside it, **`ctrl+x`
+  deletes the highlighted clip from the store**, behind a `y/N` confirm — on
+  every device, with no undo and no trash. Unconfigured by default; see
+  [The shared clipboard](#the-shared-clipboard-ctrlg).
 - **Fire telemetry** — every open/cancel/select appends a JSONL row to a
   local spool, so an audit can tell used rows from dead ones.
 
@@ -99,6 +101,10 @@ Exit codes: `0` success/no-op (a picker cancel is 0), `1` a real failure
 Picker keys: `↑/↓` move · `⏎` paste · `ctrl+e` edit · `ctrl+g` shared
 clipboard · `esc` cancel.
 
+Shared-clipboard keys (`ctrl+g`, a disjoint table — nothing falls through to
+the ones above): `↑/↓` move · `⏎` paste the clip · `ctrl+x` delete the clip
+from the store, behind a `y/N` confirm · `esc` back to the catalog.
+
 ## The shared clipboard (`ctrl+g`)
 
 A second keypress inside the picker switches to a **cross-device clipboard**:
@@ -130,6 +136,11 @@ It is a **mode, not a merged list**, and deliberately so:
   is not recorded in the catalog's browse order.
 - clip fire rows carry their own telemetry `source` (`snipclip`), so an audit
   of *catalog* demand never counts a clipboard paste as demand for a snippet.
+  Those rows also carry **no query**: the shared filter matches on the clip
+  *body*, so what you type here is a fragment of the captured text, and it is
+  dropped before the row is written (the `method` flag — whether anything was
+  typed at all — is kept). A catalog row still carries its query, which is
+  label words.
 
 ### Configuring it
 
@@ -151,12 +162,29 @@ never a silent empty list — the file path and both key names are in the
 message. The URL must be `http(s)`; the token must be at least 8 characters.
 
 The service it talks to is four routes — `GET /v1/clips?limit=N&q=…`,
-`POST /v1/clips`, `DELETE /v1/clips/{id}`, `GET /healthz`. snip only
-**reads** (`GET /v1/clips?limit=N`) and filters locally; it does not capture,
-does not delete, and does not use the server's `q=` search, whose semantics
-are its own (a full-text index's substring matching is not the same rule as
-this client's per-token body substring test, and the two must not be assumed
-to agree).
+`POST /v1/clips`, `DELETE /v1/clips/{id}`, `GET /healthz`. snip **reads**
+(`GET /v1/clips?limit=N`) and filters locally, and **deletes**
+(`DELETE /v1/clips/{id}`) when the operator presses `ctrl+x` and answers the
+confirm. It does **not** capture — nothing in snip writes a clip — and it does
+not use the server's `q=` search, whose semantics are its own (a full-text
+index's substring matching is not the same rule as this client's per-token body
+substring test, and the two must not be assumed to agree).
+
+### Deleting a clip (`ctrl+x`)
+
+`ctrl+x` in the shared mode removes the highlighted clip **from the store**:
+every device loses it, there is no trash and the service has no undo. So:
+
+- it only **asks**. The chord raises a modal `[y/N]` naming the clip's id and a
+  preview of its body, and nothing is called until `y`. The prompt is rendered
+  from the armed state itself, so no other event can take the question off the
+  screen while leaving the answer live.
+- the list on screen must be the store's **current answer**. While a fetch or a
+  delete is in flight — re-entering the mode, or the re-list after a deletion —
+  `⏎` and `ctrl+x` are inert, because the rows are from the previous read.
+- the list is **re-read from the store** after a delete lands rather than edited
+  locally, so a refused delete can never show a deletion that did not happen.
+- a 404 is **success**: the row is gone either way, which is what was asked for.
 
 ## Nix
 

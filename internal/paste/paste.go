@@ -123,7 +123,15 @@ func sourceFor(req Request) string {
 	return telemetry.SourceSnip
 }
 
-// Run executes the paste sequence. It emits EXACTLY ONE telemetry row per
+// Run executes the paste sequence.
+//
+// ⚠ THE ROW'S QUERY IS REDACTED AT THE SINK FOR AN EPHEMERAL (CLIP) PASTE —
+// telemetry.FireFieldsSource drops query/search_term for SourceClip rows,
+// because the shared mode's filter is a substring of a clip BODY and the spool
+// ships to a store with its own retention. The request's Query is handed over
+// verbatim here on purpose: one rule, one place.
+//
+// The rest of the contract: Run emits EXACTLY ONE telemetry row per
 // invocation — outcome=select on success, outcome=abort for every no-paste
 // path — and NEVER returns an error that outranks the row: telemetry and
 // toasts are best-effort, the paste decision is deterministic.

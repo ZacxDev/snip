@@ -81,6 +81,9 @@ func usage() {
       ctrl+g           the SHARED CLIPBOARD: the cross-device clip store, as a
                        disjoint mode with its own list and its own filter
                        (fetched on this keypress, never at open)
+      ctrl+x           in the shared mode only: DELETE the highlighted clip
+                       from the store — every device, no undo, no trash —
+                       behind a [y/N] confirm naming the clip
   snip paste           the detached paste helper (spawned by the picker)
       --label L        the snippet to paste, by its label (required)
       --body-file F    paste F's contents instead of the artifact's body

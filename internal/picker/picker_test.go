@@ -741,8 +741,14 @@ func TestAnEmptiedBodyAsksToDeleteInsteadOfLanding(t *testing.T) {
 	if m2.confirmDelete != "Merge rule" {
 		t.Fatalf("confirmDelete = %q, want the row under the cursor", m2.confirmDelete)
 	}
-	if !strings.Contains(m2.notice, "delete") || !strings.Contains(m2.notice, "[y/N]") {
-		t.Fatalf("the prompt must say what it is asking: %q", m2.notice)
+	// 🔴 ASSERTED ON THE RENDERED FRAME, NOT ON m.notice. The prompt is
+	// DERIVED from confirmDelete at render time (confirmPrompt) precisely so
+	// there is no stored copy for a handler to clear; asserting on a stored
+	// string would be asserting on the shape the blocker lived in.
+	screen := strings.Join(bareLines(m2), "\n")
+	if !strings.Contains(screen, "delete") || !strings.Contains(screen, "[y/N]") ||
+		!strings.Contains(screen, "Merge rule") {
+		t.Fatalf("the prompt must say what it is asking, on screen: %q", screen)
 	}
 }
 

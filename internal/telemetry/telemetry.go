@@ -244,6 +244,27 @@ func FireFieldsSource(p Payload, source string) []Field {
 	if source == "" {
 		source = SourceSnip
 	}
+	// 🔴 A CLIP ROW CARRIES NO QUERY, AND THE REDACTION LIVES HERE BECAUSE THIS
+	// IS THE ONE PLACE EVERY ROW PASSES.
+	//
+	// For the catalog the query is a few words of a snippet's own label or its
+	// declared search_terms — non-secret, and the audit's term evidence is made
+	// of it. In the SHARED CLIPBOARD the operator is typing substrings of CLIP
+	// BODIES: the filter matches on the body and nothing else, so the query is
+	// a fragment of the captured text itself, which the design treats as
+	// possibly credential-bearing. The spool ships to ClickHouse, which has its
+	// own retention that no part of this feature's design scoped — so the
+	// shared mode's filter must not reach it (round-1 finding 6).
+	//
+	// Redacting at the SINK rather than at each caller is the point: the picker
+	// emits clip rows (cancel/abort) and the paste helper emits them
+	// (select/abort), and a third caller would arrive redacted without knowing
+	// this rule exists. `method` is kept: "search" vs "direct" says only
+	// WHETHER something was typed, which is the signal the audit reads, and it
+	// carries none of the text.
+	if source == SourceClip {
+		p.Query, p.SearchTerm = "", ""
+	}
 	p.Tool = "snip"
 	p.Matcher = MatcherVersion
 	p.Inferred = false

@@ -274,6 +274,16 @@ type Model struct {
 	// populations, two prompts — the same reason the key tables are disjoint.
 	confirmClipID int64
 
+	// deletingClipID is the clip whose DELETE is in flight: set when `y` is
+	// answered (which takes the prompt down), cleared by clipDeleted.
+	//
+	// 🔴 IT IS WHY THE DECLINE ARM CANNOT LIE. With one field for both states,
+	// pressing `n` after `y` printed "the clip is still in the store" while the
+	// DELETE was on the wire and about to land. It is also half of listIsStale:
+	// a row whose removal is in flight must not be pasteable or deletable
+	// again.
+	deletingClipID int64
+
 	// fetchFailed is "the last fetch returned a reason, not rows".
 	//
 	// 🔴 IT CANNOT BE DERIVED FROM len(clips) == 0, AND ASSUMING IT COULD IS
@@ -422,22 +432,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// — the picker stays open, the catalog still works, and the operator
 		// is told why the shared view is unavailable instead of reading an
 		// empty list as "you have no clips".
+		//
+		// 🔴 AND IT TOUCHES NOTHING THE BROWSE VIEW OWNS. The fetch is in
+		// flight across an `esc`, so this message can arrive while the CATALOG
+		// list is on screen: the cursor it used to reset and the notice it used
+		// to write both belong to whatever mode is showing, and resetting a
+		// catalog cursor to 0 from here moved the operator's selection out from
+		// under a pending Enter (round-1 finding 5). The clip rows are still
+		// taken — they are this mode's data, not the browse view's — and
+		// everything POSITIONAL or VISIBLE is left alone unless the shared view
+		// is the one on screen.
 		m.fetching = false
 		m.fetched = true
 		if v.Err != nil {
 			m.fetchFailed = true
 			m.toast("shared clipboard: " + v.Err.Error())
-			m.notice = "shared clipboard: " + v.Err.Error()
+			if m.mode == modeShared {
+				m.notice = "shared clipboard: " + v.Err.Error()
+			}
 			return m, nil
 		}
 		m.fetchFailed = false
 		m.clips = v.Clips
+		if m.mode != modeShared {
+			// The rows are held for the next ctrl+g, which refilters on the way
+			// in; nothing on screen is the shared mode's, so nothing is moved.
+			return m, nil
+		}
 		m.notice = ""
 		m.cursor = 0
 		m.refilter()
 		return m, nil
 	case clipDeleted:
-		m.confirmClipID = 0
+		// The answered prompt is already down (stepShared moved the id into
+		// deletingClipID when `y` was pressed); this is the in-flight marker
+		// being cleared, success or failure.
+		m.confirmClipID, m.deletingClipID = 0, 0
 		if v.Err != nil {
 			// 🔴 THE LIST IS LEFT EXACTLY AS IT WAS. A refused delete that
 			// dropped the row would show a deletion that did not happen — and
@@ -529,11 +559,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.notice = "no change — nothing committed"
 			return m, nil
 		case v.Empty:
-			// 🔴 CONFIRMED, because it is destructive AND it lands on main. The
-			// prompt names the label so the answer cannot be about a different
-			// row than the one under the cursor.
+			// 🔴 CONFIRMED, because it is destructive AND it lands on main.
+			// Arming the field is ALL this does: the prompt itself is rendered
+			// from it (confirmPrompt), so no handler can clear the question
+			// while leaving the answer live.
 			m.confirmDelete = m.editLabel
-			m.notice = fmt.Sprintf("delete %q — its body is empty. [y/N]", m.editLabel)
 			return m, nil
 		case v.Err != nil:
 			m.toast("edit failed: " + v.Err.Error())
@@ -603,8 +633,8 @@ func (m Model) View() tea.View {
 // theme package), not here.
 func (m Model) Lines() []string {
 	out := []string{m.header()}
-	if m.notice != "" {
-		out = append(out, ui.StyNotice.Render(" "+truncate(m.notice, m.Width-1)))
+	if line := m.noticeLine(); line != "" {
+		out = append(out, ui.StyNotice.Render(" "+truncate(line, m.Width-1)))
 	}
 	start, end := m.window()
 	if m.mode == modeShared {
@@ -739,14 +769,93 @@ func (m Model) rowLine(i int) string {
 	return pointer + icon + " " + labelStyle.Render(label)
 }
 
+// confirmPrompt is THE DELETE PROMPT, DERIVED FROM THE ARMED STATE AND NOTHING
+// ELSE.
+//
+// 🔴 THE ARMED HALF AND THE VISIBLE HALF ARE ONE FACT NOW. They used to be two:
+// `confirmClipID` (which answers `y`) and a copy of the prompt text parked in
+// `m.notice` (which is what the operator sees). Three handlers wrote
+// `m.notice = ""` without looking at the confirm fields, so a fetch landing
+// between the ctrl+x and the keypress wiped the prompt off the screen while
+// leaving it ARMED — and `y`, the first character of an ordinary filter query,
+// then deleted a clip with no prompt in sight and "type to filter" in the
+// footer (round-1 blocker). Adding `if m.confirmClipID == 0` to each
+// `m.notice = ""` site would be the same predicate open-coded at N sites,
+// regenerating the bug at site N+1; instead the prompt is COMPUTED at render
+// time from the field that arms it, so there is no stored copy for anything to
+// clear. The invariant a guard can pin: confirmClipID != 0 ⇒ the rendered frame
+// carries this clip's prompt.
+//
+// The clip prompt wins over the catalog one because the two are never armed
+// together (disjoint modes, disjoint key tables), and an arbitrary order is
+// better than a frame that shows neither.
+func (m Model) confirmPrompt() string {
+	if m.confirmClipID != 0 {
+		// The prompt NAMES THE ROW — its id and a one-line preview of its body
+		// — so the answer cannot be about a different clip than the one under
+		// the cursor, the property the catalog prompt's label spelling has.
+		//
+		// 🔴 THE `[y/N]` LEADS, unlike the catalog prompt's trailing one. This
+		// line is TRUNCATED to the terminal width, and with the ask at the end
+		// an 80-column terminal cut it off — measured, as the first run of this
+		// feature's own test. A destructive prompt whose answer shape is the
+		// part that disappears is worse than one with a short preview, so the
+		// preview is what gives way.
+		// 🔴 THE PREVIEW IS LOOKED UP, AND ITS ABSENCE IS SAID OUT LOUD. The
+		// prompt is rendered from the id, and the clip list is re-read from the
+		// store underneath it, so the row CAN be gone by the time this renders
+		// (another device deleted it, or the store answered without it). A
+		// quoted empty string there would read as a clip whose body is empty;
+		// the operator is being asked to destroy something and must not be
+		// shown a blank where the thing is named.
+		for _, c := range m.clips {
+			if c.ID == m.confirmClipID {
+				return fmt.Sprintf("[y/N] delete clip %d from the shared store — %q · no undo",
+					m.confirmClipID, truncate(oneLine(c.Body), 32))
+			}
+		}
+		return fmt.Sprintf("[y/N] delete clip %d from the shared store — (that row is no longer listed) · no undo",
+			m.confirmClipID)
+	}
+	if m.confirmDelete != "" {
+		// 🔴 CONFIRMED, because it is destructive AND it lands on main. The
+		// prompt names the label so the answer cannot be about a different row
+		// than the one under the cursor.
+		return fmt.Sprintf("delete %q — its body is empty. [y/N]", m.confirmDelete)
+	}
+	return ""
+}
+
+// noticeLine is the one line above the list: the DELETE PROMPT when one is
+// armed, else whatever the last handler had to say. The prompt outranks the
+// notice deliberately — a prompt that can be covered is a prompt that can be
+// answered blind, which is the whole of the round-1 blocker.
+func (m Model) noticeLine() string {
+	if p := m.confirmPrompt(); p != "" {
+		return p
+	}
+	return m.notice
+}
+
 // chromeLines is how many non-row lines the frame carries: the header and the
-// footer, plus the notice when present. ⚠ There is deliberately NO preview
+// footer, plus the notice/prompt line when present, plus the shared mode's own
+// body line when IT is present too. ⚠ There is deliberately NO preview
 // line: the operator picks by DESCRIPTION and does not read the expansion
 // before pasting, so rendering `trigger → body` under the list was noise he
 // asked to have removed (2026-10-31). Do not re-add it without asking.
+//
+// 🔴 IT COUNTS EVERY LINE Lines() EMITS THAT IS NOT A ROW, AND sharedBodyLine
+// IS ONE OF THEM. While `fetching` that line is appended IN ADDITION to the
+// rows (the re-entry and post-delete re-list states, where the previous answer
+// is still on screen), so leaving it out overflowed the terminal by exactly one
+// line — measured at Height=10: 10 lines settled, 11 re-listing (round-1
+// finding 8). Keep this in step with Lines().
 func (m *Model) chromeLines() int {
 	n := 2 // header + footer
-	if m.notice != "" {
+	if m.noticeLine() != "" {
+		n++
+	}
+	if m.mode == modeShared && m.sharedBodyLine() != "" {
 		n++
 	}
 	return n
@@ -1023,6 +1132,16 @@ func finish(m Model) int {
 	case m.Selected != "":
 		// The helper was spawned (it owns the select row) — nothing to emit.
 		return 0
+	case m.ClipPasted != 0:
+		// 🔴 A CLIP PASTE IS A PASTE, AND ITS HELPER OWNS THE ROW. This case
+		// used to be absent, so every successful clip paste fell through to the
+		// default arm and emitted outcome=cancel ON TOP of the helper's
+		// select row — one paste, two rows, and a clip store in 100% use read
+		// as 50% cancels (round-1 finding 2). The clip path sets ClipPasted
+		// rather than Selected (the clip has no label to put there: the two
+		// populations do not share an identity field), which is exactly why
+		// the Selected test above cannot see it.
+		return 0
 	default:
 		// Cancelled (Esc/ctrl+c) or closed with nothing chosen: one cancel
 		// row, exit 0 — an open that resolved to nothing is demand evidence,
@@ -1054,6 +1173,12 @@ func sourceFor(m Model) string {
 // comes from the environment snip-launch captured (the model has no window
 // knowledge of its own); the label is the chosen row's label when one was
 // chosen, else "".
+//
+// ⚠ THE QUERY IS PASSED VERBATIM HERE AND REDACTED AT THE SINK. A row emitted
+// under telemetry.SourceClip has its query/search_term dropped by
+// telemetry.FireFieldsSource — the shared mode's filter is a substring of a
+// clip BODY. Do not re-implement that test here: one rule, one place, and this
+// is not the place (telemetry.FireFieldsSource says why).
 func row(m Model, outcome string) telemetry.Payload {
 	return telemetry.Payload{
 		Method:        paste.MethodFor(m.query),
