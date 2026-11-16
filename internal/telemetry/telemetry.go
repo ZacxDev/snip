@@ -285,13 +285,14 @@ func FireFieldsSource(p Payload, source string) []Field {
 	}
 }
 
-// EmitFire builds and appends one snip fire row. Best-effort, like Emit.
-func EmitFire(p Payload, spoolDir string) string {
-	return Emit(FireFields(p), spoolDir)
-}
-
-// EmitFireSource is EmitFire with the row's source named — the shared
-// clipboard's emitter.
+// EmitFireSource builds and appends one snip fire row with the row's source
+// named. Best-effort, like Emit.
+//
+// It is the ONLY fire emitter: a source-less EmitFire existed until both call
+// sites named their source, and keeping it meant two ways to write the same row
+// where the defaulted one silently lands in source=snip. A caller that wants
+// the catalog's source passes SourceSnip (or "", which FireFieldsSource maps to
+// it).
 func EmitFireSource(p Payload, source, spoolDir string) string {
 	return Emit(FireFieldsSource(p, source), spoolDir)
 }

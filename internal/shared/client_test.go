@@ -207,24 +207,6 @@ func TestAnUnparseableAnswerIsAnError(t *testing.T) {
 	}
 }
 
-// Search escapes the query and asks the SERVER — the one caller-visible
-// difference from Rows. The picker does not use it; this pins the URL shape so
-// the two semantics stay separable.
-func TestSearchEscapesTheQuery(t *testing.T) {
-	var gotPath string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.RequestURI()
-		_, _ = w.Write([]byte(`{"clips":[],"limit":100,"query":"a b&c"}`))
-	}))
-	defer srv.Close()
-	if _, err := New(stubCfg(srv.URL)).Search("a b&c", 0); err != nil {
-		t.Fatal(err)
-	}
-	if gotPath != "/v1/clips?limit=100&q=a+b%26c" {
-		t.Errorf("path = %q, want the query escaped", gotPath)
-	}
-}
-
 // Age's units, pinned with LITERAL expectations. created_at is epoch millis;
 // reading it as seconds renders every clip as decades old, so the boundary
 // cases are the ones worth having.

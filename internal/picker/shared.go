@@ -370,10 +370,13 @@ func (m Model) sharedBodyLine() string {
 	switch {
 	case m.fetching:
 		return ui.StyDim.Render("  fetching the shared clipboard…")
-	case !m.fetched:
-		// Only reachable if a render happens between the keypress and the
-		// fetch command running; say what is pending rather than "no match".
-		return ui.StyDim.Render("  fetching the shared clipboard…")
+	// There is no `!m.fetched` arm. It looked like the render between the
+	// keypress and the fetch command running, but the ONLY `mode = modeShared`
+	// assignment sets `fetching = true` in the same arm, `fetching` is cleared
+	// in the one place that also sets `fetched`, and nothing ever clears
+	// `fetched` — so while this function runs (it is only called under
+	// `mode == modeShared`) `fetching || fetched` always holds. The arm was
+	// unreachable AND returned the same string as the one above it.
 	case m.fetchFailed:
 		// 🔴 CHECKED BEFORE THE EMPTY CASE, AND NOT DERIVED FROM IT. The
 		// reason itself is in the notice above the list; this line says the

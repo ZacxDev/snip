@@ -100,33 +100,20 @@ func (c *Client) Rows(limit int) ([]Clip, error) {
 	return resp.Clips, nil
 }
 
-// Search asks the SERVER to filter. It is deliberately unused by the picker,
-// which filters locally over the rows it already holds (the body travels with
-// the paste, so the picker has every clip it displays).
+// There is deliberately NO Search method here. The server owns `?q=`, but snip
+// never asks it to filter: the picker matches LOCALLY over the rows it already
+// holds (the body travels with the paste, so the picker has every clip it
+// displays) — design §4.4.
 //
-// 🔴 THE TWO MATCHERS DO NOT AGREE, AND THAT IS WHY THIS IS SEPARATE. The
-// server's index is FTS5 trigram: it matches genuine substrings ACROSS word
-// boundaries, and because a query whose shortest token is under 3 RUNES is
-// served by a LIKE scan instead of the index, its case-folding depends on the
-// query's LENGTH (the index folds case beyond ASCII; the scan folds ASCII
-// only). RankShared is a per-token substring test over the body and knows none
-// of that. Nothing in snip may assume the two return the same rows.
-func (c *Client) Search(query string, limit int) ([]Clip, error) {
-	if limit <= 0 {
-		limit = DefaultLimit
-	}
-	u := strings.TrimRight(c.cfg.URL, "/") + "/v1/clips?limit=" + strconv.Itoa(limit) +
-		"&q=" + url.QueryEscape(query)
-	body, err := c.get(u)
-	if err != nil {
-		return nil, err
-	}
-	var resp listResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("unreadable answer from the clip store: %v", err)
-	}
-	return resp.Clips, nil
-}
+// 🔴 AND THE TWO MATCHERS WOULD NOT AGREE, which is why a server-side filter is
+// not a drop-in alternative to the local one. The server's index is FTS5
+// trigram: it matches genuine substrings ACROSS word boundaries, and because a
+// query whose shortest token is under 3 RUNES is served by a LIKE scan instead
+// of the index, its case-folding depends on the query's LENGTH (the index folds
+// case beyond ASCII; the scan folds ASCII only). RankShared is a per-token
+// substring test over the body and knows none of that. If a client ever does
+// need the server's filter, it is a new method with that difference in its
+// contract — not a second matcher nothing branches on.
 
 // Delete removes one clip from the store, by the id the list route served.
 //

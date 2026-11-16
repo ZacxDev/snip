@@ -27,8 +27,13 @@ var emitFireFn = func(p telemetry.Payload, source string) string {
 
 func emitFire(p telemetry.Payload, source string) string { return emitFireFn(p, source) }
 
-// nowMSFn is the clock the clip rows' ages render against, as a package var so
-// a test can freeze it without the model carrying one.
+// nowMSFn is the real clock the clip rows' ages render against, and it lives
+// here because this is the world-touching file: the pure model (picker.go,
+// shared.go) must not call time.Now itself.
+//
+// 🔴 IT IS NOT THE TEST SEAM — that is Model.NowMS, which Model.nowMS prefers
+// whenever it is non-zero, and which is what the clock-sensitive test sets. No
+// test assigns this var; the comment here used to claim one did.
 var nowMSFn = func() int64 { return time.Now().UnixMilli() }
 
 // editorCommand resolves the editor to run on the staged body and returns the
