@@ -742,6 +742,13 @@ func TestTheSharedFooterAdvertisesDelete(t *testing.T) {
 // behaviourally invisible, so no amount of key-pressing can see it; only
 // reading the table can. The source IS the ledger now, and it fails when the
 // browse set grows into the shared chords.
+//
+// ⚠ ITS BLIND SPOT IS SHAPE, NOT CONTENT: it reads `case` labels of a
+// `switch msg.String()` and nothing else, so the same collision spelled
+// `if msg.String() == DeleteKey { … }` ahead of the browse switch is invisible
+// to it and leaves the whole suite green (mutation-proven). Read it as "the
+// browse SWITCH does not name these keys", not as "no browse code handles
+// them"; making it shape-general was considered and is not what this guard is.
 func keyTableOf(t *testing.T, file, funcName string) map[string]bool {
 	t.Helper()
 	fset := token.NewFileSet()
@@ -1173,6 +1180,36 @@ func TestTheStaleListIsNotActionableWhileAFetchIsInFlight(t *testing.T) {
 		t.Fatalf("ctrl+x armed a second delete while one was in flight: %+v / id=%d",
 			intents, again.confirmClipID)
 	}
+
+	// 🔴 AND A FETCH THAT FAILED IS STALE TOO — the arm listIsStale's own
+	// docstring promised ("the rows on screen are not an answer the store has
+	// given yet") and did not have. The re-fetch over the previous visit's rows
+	// comes back `i/o timeout`: the fetch is no longer in flight, so the
+	// `fetching` arm above has let go, while the rows are still the previous
+	// visit's and the store has said nothing about them. Measured on the
+	// pre-change predicate: fetching=false fetchFailed=true stale=false rows=3,
+	// all three rendered, ctrl+x arming clip 9 and enter emitting SelectClip{9}.
+	// The same end state is reachable a second way — a SUCCESSFUL delete whose
+	// post-delete re-list then fails leaves the just-deleted clip on screen —
+	// and the single disjunct closes both.
+	fx2 := &fakeLauncher{clips: clipRows}
+	f := enterShared(t, fx2)
+	f = upd(f, tea.KeyPressMsg{Code: tea.KeyEscape})
+	f, _ = updCmd(f, ctrl('g'))
+	f = upd(f, sharedFetched{Err: errors.New("i/o timeout")})
+	if f.fetching || !f.fetchFailed || len(f.filteredClips) != 3 {
+		t.Fatalf("fixture: fetching=%v fetchFailed=%v rows=%d — want a FAILED "+
+			"re-fetch over the previous visit's three rows",
+			f.fetching, f.fetchFailed, len(f.filteredClips))
+	}
+	if pasted, intents := f.Step(tea.KeyPressMsg{Code: tea.KeyEnter}); len(intents) != 0 || pasted.ClipPasted != 0 {
+		t.Errorf("enter pasted from rows a FAILED fetch left on screen: %+v / "+
+			"ClipPasted=%d — the store has not answered for them", intents, pasted.ClipPasted)
+	}
+	if armed, intents := f.Step(ctrl('x')); len(intents) != 0 || armed.confirmClipID != 0 {
+		t.Errorf("ctrl+x armed a delete against rows a FAILED fetch left on screen: "+
+			"%+v / id=%d", intents, armed.confirmClipID)
+	}
 }
 
 // 🔴 THE DECLINE ARM CANNOT PRINT A FALSE REASSURANCE. Pressing `n` after `y`
@@ -1311,13 +1348,93 @@ func TestALateFetchDoesNotMoveTheBrowseView(t *testing.T) {
 		t.Errorf("the failure arm moved the browse cursor to %d", failed.cursor)
 	}
 
-	// POSITIVE CONTROL: the same message IN shared mode does render the reason
-	// and does reset the cursor, so the silences above are about the mode.
+	// POSITIVE CONTROL: the same message IN shared mode does render the reason,
+	// so the silences above are about the mode. It does NOT reset the cursor in
+	// either mode any more — the shared arm keeps it on the same clip id
+	// (TestALandingFetchKeepsTheSharedCursorOnItsClip).
 	shared := upd(enterShared(t, fx), sharedFetched{Err: errors.New("i/o timeout")})
 	if !strings.Contains(strings.Join(bareLines(shared), "\n"), "i/o timeout") {
 		t.Fatal("the reason is not rendered in shared mode either — this control " +
 			"proves nothing")
 	}
+}
+
+// 🔴 AND IT MUST NOT MOVE THE SHARED CURSOR EITHER, WHICH IS THE SAME FINDING
+// ONE MODE OVER. The round-1 fix made `m.cursor = 0` conditional on
+// `mode == modeShared` rather than removing it, and navigation is deliberately
+// live while the list is stale — so re-entering the mode, moving down twice and
+// letting the re-fetch land put the cursor back on row 0 under a pending Enter:
+// measured as a paste of clip 9 where the operator was looking at clip 7. A
+// clip body is arbitrary captured text (the fixture's row 0 is a password), so
+// the wrong row is a credential in whatever window has focus.
+//
+// The cursor is therefore CLAMPED, NOT RESET: it stays on the same clip ID when
+// that id is still in the store's answer, and otherwise lands in range.
+func TestALandingFetchKeepsTheSharedCursorOnItsClip(t *testing.T) {
+	fx := &fakeLauncher{clips: clipRows}
+	m := enterShared(t, fx)
+	m = upd(m, tea.KeyPressMsg{Code: tea.KeyEscape})
+	m, pending := updCmd(m, ctrl('g'))
+	m = upd(m, tea.KeyPressMsg{Code: tea.KeyDown})
+	m = upd(m, tea.KeyPressMsg{Code: tea.KeyDown})
+	if m.cursor != 2 || !m.fetching || m.filteredClips[m.cursor].ID != 7 {
+		t.Fatalf("fixture: cursor=%d fetching=%v id=%d — want the cursor on clip 7 "+
+			"with the re-fetch in flight", m.cursor, m.fetching, m.filteredClips[m.cursor].ID)
+	}
+	held := m // the same in-flight model, for the two arms below
+
+	// 🔴 THE ANSWER ARRIVES WITH A NEW CLIP AT THE HEAD, which is the
+	// newest-first store's ordinary case: another device captured something
+	// while this visit was away. Every surviving row's INDEX therefore shifts,
+	// so holding the index would point one row off and only holding the ID
+	// tracks the operator's row. The ids and the indices are pairwise distinct
+	// here on purpose — 11/9/8/7 at 0/1/2/3 — so neither a kept index nor a
+	// hardcoded 0 or 2 can pass this.
+	grown := append([]shared.Clip{{
+		ID: 11, Body: "fresh from the phone", Device: "phone", CreatedAt: 1_700_000_100_000,
+	}}, clipRows...)
+	m = upd(m, sharedFetched{Clips: grown})
+	if got := m.filteredClips[m.cursor].ID; got != 7 {
+		t.Errorf("the cursor is on clip %d after the fetch landed, want 7 — the row "+
+			"under a pending Enter changed out from under the operator", got)
+	}
+	if m.cursor != 3 {
+		t.Errorf("cursor = %d, want 3 — clip 7 moved down one row when the new clip "+
+			"landed at the head", m.cursor)
+	}
+	sel, intents := m.Step(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if len(intents) != 1 {
+		t.Fatalf("enter produced %+v, want one SelectClip", intents)
+	}
+	if sc, ok := intents[0].(SelectClip); !ok || sc.ID != 7 {
+		t.Errorf("enter emitted %+v, want SelectClip{ID: 7} — the clip the cursor "+
+			"was on before the fetch landed", intents[0])
+	}
+	if sel.ClipPasted != 7 {
+		t.Errorf("ClipPasted = %d, want 7", sel.ClipPasted)
+	}
+
+	// And an answer that carries the same rows in the same order leaves the
+	// cursor exactly where it was — driven through the real cmd the keypress
+	// returned, rather than a hand-built message.
+	same := held
+	for _, msg := range runCmd(pending) {
+		same = upd(same, msg)
+	}
+	if same.cursor != 2 || same.filteredClips[same.cursor].ID != 7 {
+		t.Errorf("an unchanged answer moved the cursor to %d (clip %d), want 2 (clip 7)",
+			same.cursor, same.filteredClips[same.cursor].ID)
+	}
+
+	// 🔴 AND WHEN THE ID IS GONE FROM THE ANSWER, THE CURSOR CLAMPS INTO RANGE
+	// rather than being left past the end of a shorter list: another device's
+	// delete, or this picker's own post-delete re-list.
+	gone := upd(held, sharedFetched{Clips: clipRows[:1]})
+	if gone.cursor != 0 {
+		t.Errorf("cursor = %d over a one-row answer, want 0", gone.cursor)
+	}
+	gone.Width = 120
+	_ = gone.Lines() // the clamp is what keeps this render in range at all
 }
 
 // 🔴 THE FRAME FITS THE TERMINAL HEIGHT IN EVERY SHARED STATE, THE RE-LIST

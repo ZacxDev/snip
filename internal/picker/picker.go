@@ -453,6 +453,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.fetchFailed = false
+		// The clip the cursor is on BEFORE the answer replaces the rows — read
+		// here because the next line is what makes it unreadable.
+		prevClipID := int64(0)
+		if m.mode == modeShared && m.cursor >= 0 && m.cursor < len(m.filteredClips) {
+			prevClipID = m.filteredClips[m.cursor].ID
+		}
 		m.clips = v.Clips
 		if m.mode != modeShared {
 			// The rows are held for the next ctrl+g, which refilters on the way
@@ -460,8 +466,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.notice = ""
-		m.cursor = 0
+		// 🔴 CLAMPED, NOT RESET. The reset this replaces was round-1 finding 5's
+		// fix applied on one axis only — it was made conditional on the shared
+		// mode rather than removed — and navigation is deliberately live while
+		// the list is stale, so the two combined INSIDE the mode: re-enter with
+		// the fetch in flight, move down twice, and the landing answer put the
+		// cursor back on row 0 under a pending Enter. A clip body is arbitrary
+		// captured text, so that pastes whatever row 0 happens to be — a
+		// credential, into whatever window has focus. The cursor stays on the
+		// SAME CLIP ID when the store's answer still carries it; when it does
+		// not (another device's delete, or this picker's own post-delete
+		// re-list) refilter's clamp lands it in range.
 		m.refilter()
+		if prevClipID != 0 {
+			for i, c := range m.filteredClips {
+				if c.ID == prevClipID {
+					m.cursor = i
+					break
+				}
+			}
+		}
 		return m, nil
 	case clipDeleted:
 		// The answered prompt is already down (stepShared moved the id into
@@ -844,12 +868,18 @@ func (m Model) noticeLine() string {
 // before pasting, so rendering `trigger → body` under the list was noise he
 // asked to have removed (2026-10-31). Do not re-add it without asking.
 //
-// 🔴 IT COUNTS EVERY LINE Lines() EMITS THAT IS NOT A ROW, AND sharedBodyLine
-// IS ONE OF THEM. While `fetching` that line is appended IN ADDITION to the
-// rows (the re-entry and post-delete re-list states, where the previous answer
-// is still on screen), so leaving it out overflowed the terminal by exactly one
-// line — measured at Height=10: 10 lines settled, 11 re-listing (round-1
-// finding 8). Keep this in step with Lines().
+// 🔴 IT COUNTS EVERY NON-ROW LINE Lines() CAN EMIT ALONGSIDE ROWS, AND
+// sharedBodyLine IS ONE OF THEM. While `fetching` that line is appended IN
+// ADDITION to the rows (the re-entry and post-delete re-list states, where the
+// previous answer is still on screen), so leaving it out overflowed the
+// terminal by exactly one line — measured at Height=10: 10 lines settled, 11
+// re-listing (round-1 finding 8). Keep this in step with Lines().
+//
+// ⚠ ONE LINE IS DELIBERATELY UNCOUNTED, so this is not "every line that is not
+// a row": browse mode's `(no match — esc to cancel)`. It renders only when
+// `len(m.filtered) == 0`, i.e. when there are no rows for it to displace, so
+// the window it is subtracted from is one nobody is scrolling. A line that can
+// appear WITH rows — as sharedBodyLine does — must be counted here.
 func (m *Model) chromeLines() int {
 	n := 2 // header + footer
 	if m.noticeLine() != "" {

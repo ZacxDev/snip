@@ -144,7 +144,17 @@ func clipMatches(body string, tokens []string) bool {
 
 // listIsStale is "the rows on screen are not an answer the store has given yet"
 // — a fetch is in flight (re-entry, where the PREVIOUS visit's rows are still
-// rendered, or the post-delete re-list) or a DELETE is in flight.
+// rendered, or the post-delete re-list), a fetch has FAILED, or a DELETE is in
+// flight.
+//
+// 🔴 THE FAILED ARM IS NOT THE IN-FLIGHT ARM. A failed fetch clears `fetching`
+// (the render must stop saying "fetching…") and leaves the clip list exactly as
+// it was, so without this disjunct the predicate let go of rows the store had
+// just declined to answer for: measured on the re-entry route as
+// `fetching=false fetchFailed=true stale=false rows=3`, with ctrl+x arming the
+// previous visit's clip and enter pasting it. `fetchFailed` is cleared by the
+// next SUCCESSFUL fetch and by nothing else, so the rows become actionable again
+// exactly when the store has answered for them.
 //
 // 🔴 IT GATES THE TWO ACTIONABLE KEYS, WHICH IS THE ALTERNATIVE TO CLEARING THE
 // ROWS ON MODE ENTRY, and it is the one chosen deliberately: clearing them
@@ -158,7 +168,9 @@ func clipMatches(body string, tokens []string) bool {
 //
 // The screen already says why: sharedBodyLine renders "fetching the shared
 // clipboard…" for exactly this window.
-func (m Model) listIsStale() bool { return m.fetching || m.deletingClipID != 0 }
+func (m Model) listIsStale() bool {
+	return m.fetching || m.fetchFailed || m.deletingClipID != 0
+}
 
 // stepShared is the shared mode's whole key table. 🔴 IT IS DISJOINT: every
 // key it does not name is swallowed, and there is no arm that falls through to
