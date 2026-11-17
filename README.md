@@ -261,6 +261,59 @@ go test ./...
 Release builds stamp the version via `-X main.buildVersion=vX.Y.Z`; the
 declaration's shape is pinned by `TestVersionDeclarationShape`.
 
+## Cutting a release
+
+`cmd/snip/version.go` is the single source of truth. `package.nix` reads that
+one line with a regex and **throws at flake-eval time** if it does not match
+exactly once, so a reformatted declaration breaks every consumer's evaluation
+instead of quietly shipping a wrong version; `TestVersionDeclarationShape`
+pins the same shape in CI, so you find out one step earlier.
+
+1. **Check whether `main` has already moved past the last tag.** Nothing
+   enforces this, which is why it is the step that gets skipped:
+
+   ```sh
+   git log --oneline "$(git describe --tags --abbrev=0)"..main
+   ```
+
+   Non-empty output while `buildVersion` still holds the tagged value means
+   merged work is sitting inside an already-published release number.
+
+2. Bump `buildVersion` in `cmd/snip/version.go` — that line only, and do not
+   reformat it.
+3. Commit and push to `main`. Pushing the bump installs nothing; see step 5.
+4. Tag it to match, and push the tag:
+
+   ```sh
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+
+5. **Update the consumer, or you have shipped nothing.** devrc pins snip as a
+   flake input, so merging and tagging change nothing on any machine until
+   someone runs `nix flake update snip` there and switches. A release that
+   stops at step 4 leaves the feature merged, tagged, and still absent from
+   the installed binary.
+
+### Why steps 1 and 5 are written down
+
+They are the two halves of one measured failure. `v0.1.1` was cut on
+2026-11-01. #2 — the whole `ctrl+g` shared clipboard — merged on 2026-11-16
+with `buildVersion` left at `"0.1.1"`, while devrc's `flake.lock` still
+pinned the commit *before* it, so the installed binary carried no
+shared-clipboard code at all. Because the version had not moved, the build
+**with** the feature and the build **without** it were both named
+`snip-0.1.1`, differing only by store hash: `snip --version` could not
+separate them, and neither could a derivation name in a diff of two system
+closures. #3 bumped it to 0.2.0 on 2026-11-17.
+
+So an unbumped version is not a cosmetic lapse — it removes the cheapest
+signal anyone has that two builds differ, which is precisely the signal you
+reach for when a merged feature appears to be missing. This is a checklist
+rather than a CI gate on purpose: the natural gate (fail while commits sit
+between the last tag and `HEAD` with the version still equal to the tag's) is
+red on every feature PR until someone bumps, and a permanently-red check only
+teaches everyone to click through it.
+
 ## Provenance
 
 snip began inside the author's configuration repository
